@@ -1,34 +1,23 @@
-# A Game About Farming and Cooking — Android packaging attempt
+# A Game About Farming and Cooking — Android build
 
-This project is based on the uploaded single-file Pygame game. The game logic and pixel-art rendering are retained, and mobile touch controls were added in `main.py`:
+This repository contains the Python/Pygame farming and cooking game and an experimental GitHub Actions workflow for building an Android debug APK.
 
-- Virtual joystick on the lower-left (hold and drag to move)
-- **USE** button to use the selected item/tool
-- **TALK** button for interaction (harvest, cook, shop, sleep, etc.)
-- **RUN** button (hold)
-- **BAG** button to open inventory
-- Tap support for the title/help/dialog screens
+## Build APK
 
-## Build APK with GitHub Actions
+1. Open the **Actions** tab.
+2. Select **Build Android APK**.
+3. Tap **Run workflow** on the `main` branch.
+4. When the run completes successfully, open it and download the `farming-cooking-android-apk` artifact.
 
-1. Create a GitHub repository and upload the contents of this folder to its root.
-2. Push to `main` or `master`, or open **Actions → Build Android APK → Run workflow**.
-3. When the workflow succeeds, open the workflow run and download the `farming-cooking-android-apk` artifact.
-4. Extract the APK and install it on an Android device. Android may ask you to allow installation from the app used to open the APK.
+If the build fails, download the `android-build-logs` artifact and check the first native build error.
 
-The workflow also uploads build logs if compilation fails.
+## Compatibility note
 
-## Important compatibility note
+The workflow uses Buildozer, python-for-android, SDL2, and a local `pygame-ce` recipe. Android packaging of Pygame is sensitive to the SDK/NDK and native library versions, so the workflow is experimental. No APK is available until a GitHub Actions run succeeds. The existing game controls are inherited from the Python source; touchscreen controls still need to be tested and may require further adaptation.
 
-The original game uses `pygame`. Current `python-for-android` documentation says the modern SDL2 bootstrap does not provide a `pygame_sdl2` recipe; this project therefore pins the older **legacy Pygame bootstrap** as an experimental build path. That toolchain is old and may fail with current Android SDK/NDK or dependency downloads. The workflow is prepared to try the build, but **no APK is claimed to exist until a GitHub Actions run completes successfully**. If it fails, use the uploaded log to identify the exact blocker; a reliable long-term solution may require porting the renderer/input layer to a currently supported Android framework.
-
-## Desktop run
-
-Install Pygame and run:
+## Run on desktop
 
 ```bash
-python -m pip install pygame
+python -m pip install pygame-ce
 python main.py
 ```
-
-Save data is written to `farm_cooking_save.json` beside the game file.
