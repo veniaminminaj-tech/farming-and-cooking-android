@@ -1,0 +1,73 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - 'main.py'
+      - 'buildozer.spec'
+      - 'p4a-recipes/**'
+      - '.github/workflows/android-apk.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git zip unzip autoconf automake libtool pkg-config \
+            zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 \
+            cmake libffi-dev libssl-dev libltdl-dev gettext patch
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install 'Cython<0.30' buildozer
+
+      - name: Verify Python source and recipe
+        run: |
+          python -m py_compile main.py p4a-recipes/pygame-ce/__init__.py
+
+      - name: Build debug APK
+        env:
+          APP_ANDROID_ACCEPT_SDK_LICENSE: '1'
+          BUILDOZER_WARN_ON_ROOT: '0'
+        run: buildozer -v android debug
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: farming-cooking-android-apk
+          path: bin/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-logs
+          path: |
+            .buildozer/android/platform/build-*/**/*.log
+            .buildozer/android/platform/python-for-android/**/build.log
+          if-no-files-found: ignore
+          retention-days: 7
