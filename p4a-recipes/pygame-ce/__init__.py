@@ -6,8 +6,8 @@ from pythonforandroid.toolchain import current_directory
 
 
 class PygameCERecipe(CompiledComponentsPythonRecipe):
-    version = "2.5.2"
-    url = "https://github.com/pygame-community/pygame-ce/archive/refs/tags/{version}.tar.gz"
+    version = "2.4.0"
+    url = "https://github.com/pygame-community/pygame-ce/archive/{version}.tar.gz"
     name = "pygame-ce"
     site_packages_name = "pygame"
     depends = [
