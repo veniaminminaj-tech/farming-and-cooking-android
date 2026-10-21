@@ -1,4 +1,5 @@
-#!/usr/bin/env python3
+# Android build trigger: pinned Buildozer and pygame-ce recipe
+#!//usr/bin/env python3
 """
 A GAME ABOUT FARMING AND COOKING
 A cozy, Stardew-Valley-style farming sim made with pygame.
