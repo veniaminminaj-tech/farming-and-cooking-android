@@ -973,6 +973,9 @@ class Game:
         try:
             data = dict(day=self.day, time=self.time, money=self.money, energy=self.energy, water=self.water,
                         rain=self.rain, inv=self.inv, bin=self.bin,
+                        cafe_served=self.cafe_served, cafe_rating=self.cafe_rating,
+                        cafe_order=self.cafe_order, max_energy=self.max_energy,
+                        bag_upgraded=getattr(self, "bag_upgraded", False),
                         soil=[[x, y, s["wet"], s["crop"], s["age"]] for (x, y), s in self.soil.items()],
                         objs=[[x, y, o["t"], o.get("hp", 1), o.get("v", 0)] for (x, y), o in self.objs.items()],
                         eggs=self.eggs, px=self.player.x, py=self.player.y)
@@ -992,6 +995,12 @@ class Game:
         self.day, self.time, self.money = d["day"], d["time"], d["money"]
         self.energy, self.water, self.rain = d["energy"], d["water"], d["rain"]
         self.inv, self.bin = d["inv"], d["bin"]
+        self.cafe_served = d.get("cafe_served", 0)
+        self.cafe_rating = d.get("cafe_rating", 1)
+        self.cafe_order = d.get("cafe_order")
+        self.max_energy = d.get("max_energy", self.max_energy)
+        self.energy = min(self.energy, self.max_energy)
+        self.bag_upgraded = d.get("bag_upgraded", False)
         self.soil = {(x, y): dict(wet=w, crop=c, age=a) for x, y, w, c, a in d["soil"]}
         self.objs = {(x, y): dict(t=t, hp=hp, v=v) for x, y, t, hp, v in d["objs"]}
         self.eggs = d.get("eggs", [])
