@@ -800,6 +800,10 @@ class Game:
         self.rain = False
         self.inv = {"parsnip_seed": 8, "wheat_seed": 5}
         self.bin = {}
+        self.cafe_served = 0
+        self.cafe_rating = 1
+        self.cafe_order = None
+        self.arcade_score = 0
         self.sel = 0
         self.sel_timer = 0.0
         self.soil = {}
@@ -867,6 +871,9 @@ class Game:
             dict(kind="bin", tx=24, ty=11, w=2, h=1),
             dict(kind="stall", tx=50, ty=15, w=5, h=3),
             dict(kind="coop", tx=45, ty=26, w=3, h=2),
+            dict(kind="cafe", tx=39, ty=15, w=4, h=3),
+            dict(kind="computer", tx=34, ty=13, w=3, h=2),
+            dict(kind="arcade", tx=40, ty=9, w=3, h=2),
         ]
         self.bld_at = {}
         for b in self.buildings:
@@ -1228,7 +1235,8 @@ class Game:
         if kind == "flower":
             return "E  Pick"
         return {"house": "E  Sleep", "kitchen": "E  Cook", "bin": "E  Ship goods",
-                "stall": "E  Shop", "coop": "E  Look"}[data["kind"]]
+                "stall": "E  Shop", "coop": "E  Look", "cafe": "E  Cafe orders",
+                "computer": "E  Farm computer", "arcade": "E  Arcade"}[data["kind"]]
 
     def interact(self):
         if self.player.act > 0 or not self.focus:
@@ -1261,6 +1269,15 @@ class Game:
                 self.state = "menu"
             elif k == "coop":
                 self.toast("Your hens lay fresh eggs every morning.")
+            elif k == "cafe":
+                self.menu = dict(type="cafe", idx=0, scroll=0)
+                self.state = "menu"
+            elif k == "computer":
+                self.menu = dict(type="computer", idx=0, scroll=0)
+                self.state = "menu"
+            elif k == "arcade":
+                self.menu = dict(type="arcade", idx=0, scroll=0)
+                self.state = "menu"
 
     def say(self, name, text):
         self.dialog = dict(name=name, text=text, shown=0.0)
@@ -1574,6 +1591,16 @@ class Game:
                 surf_.blit(SPR["stall_back"], (b["tx"] * TILE - cx, b["ty"] * TILE - cy))
             elif b["kind"] == "coop":
                 surf_.blit(SPR["coop"], (b["tx"] * TILE - cx, b["ty"] * TILE - cy))
+            elif b["kind"] in ("cafe", "computer", "arcade"):
+                bx, by = b["tx"] * TILE - cx, b["ty"] * TILE - cy
+                body = {"cafe": (222, 172, 116), "computer": (156, 176, 186), "arcade": (160, 116, 176)}[b["kind"]]
+                roof = {"cafe": (176, 72, 60), "computer": (74, 116, 132), "arcade": (78, 62, 120)}[b["kind"]]
+                pygame.draw.rect(surf_, body, (bx + 2, by + 12, b["w"] * TILE - 4, b["h"] * TILE - 12))
+                pygame.draw.rect(surf_, roof, (bx, by + 4, b["w"] * TILE, 12))
+                pygame.draw.rect(surf_, (90, 60, 40), (bx + 4, by + 20, 12, 18))
+                pygame.draw.rect(surf_, (120, 196, 220), (bx + 22, by + 20, 18, 12))
+                label = {"cafe": "CAFE", "computer": "PC", "arcade": "PLAY"}[b["kind"]]
+                self.text(label, (bx + b["w"] * TILE // 2, by + 8), self.f_s, CREAM, center=True)
         elif kind == "stall_front":
             surf_.blit(SPR["stall_front"], (d["tx"] * TILE - cx, d["ty"] * TILE - cy))
         elif kind == "lamp":
@@ -1817,6 +1844,12 @@ class Game:
     def list_for(self, kind):
         if kind == "shop":
             return [k + "_seed" for k in CROPS]
+        if kind == "cafe":
+            return ["order", "serve", "upgrade"]
+        if kind == "computer":
+            return ["parsnip_seed", "wheat_seed", "potato_seed", "tomato_seed", "pumpkin_seed", "upgrade_bag", "upgrade_energy"]
+        if kind == "arcade":
+            return ["harvest_game", "kitchen_game", "fishing_game"]
         if kind == "cook":
             return list(RECIPES)
         if kind == "bin":
@@ -1851,8 +1884,37 @@ class Game:
                     pygame.draw.rect(self.screen, GOLD, rr, border_radius=6)
                 self.text(lab, rr.center, self.f_m, TEXT, center=True)
             return
-        titles = {"shop": "Mabel's General Store", "cook": "Kitchen", "bin": "Shipping Bin", "inv": "Backpack"}
+        titles = {"shop": "Mabel's General Store", "cook": "Kitchen", "bin": "Shipping Bin", "inv": "Backpack",
+                  "cafe": "Little Cafe", "computer": "Farm Computer", "arcade": "Game Arcade"}
         entries = self.list_for(ty)
+        if ty in ("cafe", "computer", "arcade"):
+            r = pygame.Rect(WIN_W // 2 - 330, WIN_H // 2 - 250, 660, 500)
+            self.panel(r)
+            self.text(titles[ty], (r.x + 24, r.y + 18), self.f_l, TEXT)
+            if ty == "cafe":
+                self.text("Orders served: %d   Cafe rating: %d/5" % (self.cafe_served, self.cafe_rating),
+                          (r.x + 24, r.y + 58), self.f_m, PANEL_D)
+                labels = ["Get a customer order", "Serve the current order", "Upgrade cafe (300g)"]
+            elif ty == "computer":
+                labels = ["Buy Parsnip Seeds (20g)", "Buy Wheat Seeds (15g)", "Buy Potato Seeds (40g)",
+                          "Buy Tomato Seeds (60g)", "Buy Pumpkin Seeds (100g)", "Upgrade backpack (200g)",
+                          "Increase max energy (250g)"]
+                self.text("Spend your farm earnings on supplies and upgrades.", (r.x + 24, r.y + 58), self.f_s, PANEL_D)
+            else:
+                labels = ["Harvest Dash - win 10-35g", "Kitchen Rush - win 10-35g", "Fishing Catch - win 10-35g"]
+                self.text("Pick a mini-game, then press Enter to play a round.", (r.x + 24, r.y + 58), self.f_s, PANEL_D)
+            for i, label in enumerate(labels):
+                rr = pygame.Rect(r.x + 24, r.y + 108 + i * 54, r.w - 48, 44)
+                if i == m["idx"]:
+                    pygame.draw.rect(self.screen, (252, 224, 150), rr, border_radius=8)
+                    pygame.draw.rect(self.screen, GOLD, rr, 3, border_radius=8)
+                else:
+                    pygame.draw.rect(self.screen, (236, 200, 144), rr, border_radius=8)
+                self.text(label, (rr.x + 16, rr.centery), self.f_m, TEXT)
+            if ty == "arcade":
+                self.text("Last score: %d" % self.arcade_score, (r.centerx, r.bottom - 62), self.f_m, TEXT, center=True)
+            self.text("Up/Down select   Enter confirm   Esc leave", (r.centerx, r.bottom - 26), self.f_s, PANEL_D, center=True)
+            return
         r = pygame.Rect(WIN_W // 2 - 330, WIN_H // 2 - 250, 660, 500)
         self.panel(r)
         self.text(titles[ty], (r.x + 24, r.y + 18), self.f_l, TEXT)
@@ -1956,6 +2018,79 @@ class Game:
         entries = self.list_for(ty)
         if close:
             self.state, self.menu = "play", {}
+            return
+        if ty in ("cafe", "computer", "arcade"):
+            if up:
+                m["idx"] = (m["idx"] - 1) % len(entries)
+            elif down:
+                m["idx"] = (m["idx"] + 1) % len(entries)
+            elif ok:
+                i = m["idx"]
+                if ty == "cafe":
+                    if i == 0:
+                        available = [key for key in RECIPES if self.inv.get(key, 0) > 0]
+                        if available:
+                            self.cafe_order = random.choice(available)
+                            self.toast("Customer wants: " + RECIPES[self.cafe_order]["name"])
+                        else:
+                            self.toast("Cook a meal first, then accept cafe orders.")
+                    elif i == 1:
+                        if not self.cafe_order:
+                            self.toast("Get a customer order first.")
+                        elif self.inv.get(self.cafe_order, 0) <= 0:
+                            self.toast("You need to cook " + RECIPES[self.cafe_order]["name"] + " first.")
+                        else:
+                            key = self.cafe_order
+                            self.take_item(key)
+                            reward = int(RECIPES[key]["sell"] * (1.0 + self.cafe_rating * 0.1))
+                            self.money += reward
+                            self.cafe_served += 1
+                            self.cafe_rating = min(5, 1 + self.cafe_served // 3)
+                            self.cafe_order = None
+                            self.toast("Order served! +%dg" % reward)
+                    elif i == 2:
+                        if self.cafe_rating >= 5:
+                            self.toast("Your cafe is already fully upgraded.")
+                        elif self.money >= 300:
+                            self.money -= 300
+                            self.cafe_rating = min(5, self.cafe_rating + 1)
+                            self.toast("Cafe upgraded! Rating %d/5" % self.cafe_rating)
+                        else:
+                            self.toast("You need 300g to upgrade the cafe.")
+                elif ty == "computer":
+                    seeds = ["parsnip_seed", "wheat_seed", "potato_seed", "tomato_seed", "pumpkin_seed"]
+                    if i < len(seeds):
+                        key = seeds[i]
+                        price = ITEMS[key]["buy"]
+                        if self.money >= price:
+                            self.money -= price
+                            self.add_item(key)
+                        else:
+                            self.toast("Not enough gold!")
+                    elif i == 5:
+                        if getattr(self, "bag_upgraded", False):
+                            self.toast("Backpack already upgraded.")
+                        elif self.money >= 200:
+                            self.money -= 200
+                            self.bag_upgraded = True
+                            self.toast("Backpack upgraded! More hotbar room.")
+                        else:
+                            self.toast("You need 200g.")
+                    else:
+                        if self.max_energy >= 180:
+                            self.toast("Energy is already maxed out.")
+                        elif self.money >= 250:
+                            self.money -= 250
+                            self.max_energy += 20
+                            self.energy = min(self.max_energy, self.energy + 20)
+                            self.toast("Max energy increased!")
+                        else:
+                            self.toast("You need 250g.")
+                else:
+                    self.arcade_score = random.randint(10, 35)
+                    reward = self.arcade_score
+                    self.money += reward
+                    self.toast("Mini-game complete! +%dg" % reward)
             return
         if up:
             m["idx"] = max(0, m["idx"] - 1)
