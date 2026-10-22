@@ -2470,6 +2470,63 @@ class Game:
             self.sel = (self.sel + d) % n
             self.sel_timer = 2.0
 
+    def handle_menu_click(self, pos):
+        """Handle mouse clicks on menu choices and arcade mini-games."""
+        if not self.menu or self.state in ("play", "title", "summary", "fade_out", "fade_in"):
+            return
+        m = self.menu
+        ty = m.get("type", "")
+        x, y = pos
+        if ty == "arcade_round":
+            r = pygame.Rect(WIN_W // 2 - 280, WIN_H // 2 - 180, 560, 360)
+            if r.collidepoint(pos):
+                game = m.get("game", "Harvest Dash")
+                m["taps"] = m.get("taps", 0) + 1
+                if m["taps"] >= 5:
+                    self.arcade_score = random.randint(10, 35)
+                    self.money += self.arcade_score
+                    self.toast("Mini-game won! +%dg" % self.arcade_score)
+                    self.state, self.menu = "play", {}
+            return
+        if ty == "sleep":
+            r = pygame.Rect(WIN_W // 2 - 220, WIN_H // 2 - 90, 440, 180)
+            if r.collidepoint(pos):
+                i = (y - (r.y + 80)) // 40
+                if i in (0, 1):
+                    m["idx"] = int(i)
+                    self.menu_key(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN, mod=0))
+            return
+        if ty == "pause":
+            r = pygame.Rect(WIN_W // 2 - 200, WIN_H // 2 - 130, 400, 260)
+            if r.collidepoint(pos):
+                i = (y - (r.y + 80)) // 40
+                if 0 <= i < 4:
+                    m["idx"] = int(i)
+                    self.menu_key(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN, mod=0))
+            return
+        if ty in ("cafe", "computer", "arcade"):
+            r = pygame.Rect(WIN_W // 2 - 330, WIN_H // 2 - 250, 660, 500)
+            count = len(self.list_for(ty))
+            for i in range(count):
+                rr = pygame.Rect(r.x + 24, r.y + 108 + i * 54, r.w - 48, 44)
+                if rr.collidepoint(pos):
+                    m["idx"] = i
+                    self.menu_key(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN, mod=0))
+                    return
+            return
+        r = pygame.Rect(WIN_W // 2 - 330, WIN_H // 2 - 250, 660, 500)
+        rows, row_h, top = 7, 52, r.y + 84
+        entries = self.list_for(ty)
+        for vi in range(rows):
+            i = m.get("scroll", 0) + vi
+            if i >= len(entries):
+                break
+            rr = pygame.Rect(r.x + 20, top + vi * row_h, r.w - 40, row_h - 6)
+            if rr.collidepoint(pos):
+                m["idx"] = i
+                self.menu_key(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN, mod=pygame.KMOD_SHIFT if pygame.key.get_mods() & pygame.KMOD_SHIFT else 0))
+                return
+
     def run(self):
         while True:
             dt = min(self.clock.tick(FPS) / 1000.0, 0.05)
@@ -2504,7 +2561,10 @@ class Game:
                         if ev.button == 1: self.use_item()
                         elif ev.button == 3: self.interact()
                     elif ev.button == 1:
-                        self.handle_tap_outside_play(ev.pos)
+                        if self.menu and self.state not in ("play", "title", "summary", "fade_out", "fade_in"):
+                            self.handle_menu_click(ev.pos)
+                        else:
+                            self.handle_tap_outside_play(ev.pos)
             self.update(dt)
             self.draw()
             pygame.display.flip()
