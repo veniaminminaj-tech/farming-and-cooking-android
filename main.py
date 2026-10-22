@@ -1893,6 +1893,23 @@ class Game:
                     pygame.draw.rect(self.screen, GOLD, rr, border_radius=6)
                 self.text(lab, rr.center, self.f_m, TEXT, center=True)
             return
+        if ty == "arcade_round":
+            r = pygame.Rect(WIN_W // 2 - 280, WIN_H // 2 - 180, 560, 360)
+            self.panel(r)
+            game = m.get("game", "Harvest Dash")
+            key_label = {"Harvest Dash": "SPACE", "Kitchen Rush": "ENTER", "Fishing Catch": "F"}.get(game, "SPACE")
+            self.text("Mini-game: " + game, (r.centerx, r.y + 30), self.f_l, TEXT, center=True)
+            self.text("Press " + key_label + " five times to finish.", (r.centerx, r.y + 100), self.f_m, PANEL_D, center=True)
+            progress = m.get("taps", 0)
+            self.text("Progress: %d / 5" % progress, (r.centerx, r.y + 170), self.f_l, TEXT, center=True)
+            bar = pygame.Rect(r.x + 60, r.y + 225, r.w - 120, 22)
+            pygame.draw.rect(self.screen, (225, 210, 180), bar, border_radius=10)
+            if progress:
+                fill = bar.copy()
+                fill.w = int(bar.w * min(progress, 5) / 5)
+                pygame.draw.rect(self.screen, GOLD, fill, border_radius=10)
+            self.text("Esc: quit mini-game", (r.centerx, r.bottom - 26), self.f_s, PANEL_D, center=True)
+            return
         titles = {"shop": "Mabel's General Store", "cook": "Kitchen", "bin": "Shipping Bin", "inv": "Backpack",
                   "cafe": "Little Cafe", "computer": "Farm Computer", "arcade": "Game Arcade"}
         entries = self.list_for(ty)
@@ -1900,14 +1917,6 @@ class Game:
             r = pygame.Rect(WIN_W // 2 - 330, WIN_H // 2 - 250, 660, 500)
             self.panel(r)
             self.text(titles[ty], (r.x + 24, r.y + 18), self.f_l, TEXT)
-            if ty == "arcade_round":
-                game = m.get("game", "Harvest Dash")
-                key_label = {"Harvest Dash": "SPACE", "Kitchen Rush": "ENTER", "Fishing Catch": "F"}[game]
-                self.text("Game: " + game, (r.x + 24, r.y + 70), self.f_l, PANEL_D)
-                self.text("Press " + key_label + " five times to finish.", (r.x + 24, r.y + 150), self.f_m, TEXT)
-                self.text("Progress: %d / 5" % m.get("taps", 0), (r.centerx, r.y + 230), self.f_l, TEXT, center=True)
-                self.text("Esc: quit mini-game", (r.centerx, r.bottom - 26), self.f_s, PANEL_D, center=True)
-                return
             if ty == "cafe":
                 self.text("Orders served: %d   Cafe rating: %d/5" % (self.cafe_served, self.cafe_rating),
                           (r.x + 24, r.y + 58), self.f_m, PANEL_D)
