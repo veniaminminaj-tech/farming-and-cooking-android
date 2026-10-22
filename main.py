@@ -1891,9 +1891,19 @@ class Game:
             r = pygame.Rect(WIN_W // 2 - 330, WIN_H // 2 - 250, 660, 500)
             self.panel(r)
             self.text(titles[ty], (r.x + 24, r.y + 18), self.f_l, TEXT)
+            if ty == "arcade_round":
+                game = m.get("game", "Harvest Dash")
+                key_label = {"Harvest Dash": "SPACE", "Kitchen Rush": "ENTER", "Fishing Catch": "F"}[game]
+                self.text("Game: " + game, (r.x + 24, r.y + 70), self.f_l, PANEL_D)
+                self.text("Press " + key_label + " five times to finish.", (r.x + 24, r.y + 150), self.f_m, TEXT)
+                self.text("Progress: %d / 5" % m.get("taps", 0), (r.centerx, r.y + 230), self.f_l, TEXT, center=True)
+                self.text("Esc: quit mini-game", (r.centerx, r.bottom - 26), self.f_s, PANEL_D, center=True)
+                return
             if ty == "cafe":
                 self.text("Orders served: %d   Cafe rating: %d/5" % (self.cafe_served, self.cafe_rating),
                           (r.x + 24, r.y + 58), self.f_m, PANEL_D)
+                if self.cafe_order:
+                    self.text("Current order: " + RECIPES[self.cafe_order]["name"], (r.x + 24, r.y + 82), self.f_s, PANEL_D)
                 labels = ["Get a customer order", "Serve the current order", "Upgrade cafe (300g)"]
             elif ty == "computer":
                 labels = ["Buy Parsnip Seeds (20g)", "Buy Wheat Seeds (15g)", "Buy Potato Seeds (40g)",
@@ -2015,6 +2025,19 @@ class Game:
                 else:
                     self.state, self.menu = "help", {}
             return
+        if ty == "arcade_round":
+            if close:
+                self.state, self.menu = "play", {}
+                return
+            expected = {"Harvest Dash": pygame.K_SPACE, "Kitchen Rush": pygame.K_RETURN, "Fishing Catch": pygame.K_f}.get(m.get("game"))
+            if k == expected:
+                m["taps"] = m.get("taps", 0) + 1
+                if m["taps"] >= 5:
+                    self.arcade_score = random.randint(10, 35)
+                    self.money += self.arcade_score
+                    self.toast("Mini-game won! +%dg" % self.arcade_score)
+                    self.state, self.menu = "play", {}
+            return
         entries = self.list_for(ty)
         if close:
             self.state, self.menu = "play", {}
@@ -2028,12 +2051,8 @@ class Game:
                 i = m["idx"]
                 if ty == "cafe":
                     if i == 0:
-                        available = [key for key in RECIPES if self.inv.get(key, 0) > 0]
-                        if available:
-                            self.cafe_order = random.choice(available)
-                            self.toast("Customer wants: " + RECIPES[self.cafe_order]["name"])
-                        else:
-                            self.toast("Cook a meal first, then accept cafe orders.")
+                        self.cafe_order = random.choice(list(RECIPES))
+                        self.toast("Customer wants: " + RECIPES[self.cafe_order]["name"])
                     elif i == 1:
                         if not self.cafe_order:
                             self.toast("Get a customer order first.")
@@ -2087,10 +2106,8 @@ class Game:
                         else:
                             self.toast("You need 250g.")
                 else:
-                    self.arcade_score = random.randint(10, 35)
-                    reward = self.arcade_score
-                    self.money += reward
-                    self.toast("Mini-game complete! +%dg" % reward)
+                    games = ["Harvest Dash", "Kitchen Rush", "Fishing Catch"]
+                    self.menu = dict(type="arcade_round", game=games[i], taps=0)
             return
         if up:
             m["idx"] = max(0, m["idx"] - 1)
