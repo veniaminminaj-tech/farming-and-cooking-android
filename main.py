@@ -1,5 +1,4 @@
-# Android build trigger: pinned Buildozer and pygame-ce recipe
-#!//usr/bin/env python3
+#!/usr/bin/env python3
 """
 A GAME ABOUT FARMING AND COOKING
 A cozy, Stardew-Valley-style farming sim made with pygame.
@@ -21,31 +20,199 @@ HOW TO PLAY
   2. Crops grow one day for each day they are watered (rain waters for you!).
   3. Harvest with E. Cook crops into meals at the Kitchen (the teal hut).
   4. Put goods in the Shipping Bin (the wooden box). You get paid overnight.
-  5. Buy new seeds from Mabel's stall in the village (east along the path).
+  5. Open your CAFE (big building east of the farm): cook what guests order and
+     serve them at their tables. Order seeds, recipes and upgrades on the PC by
+     the house, fish at the pond, and play mini-games at the village arcade.
   6. Chop trees (axe) and mine rocks (pickaxe) to clear land.
   7. Sleep in your house before 2am or you will pass out!
 """
+import hashlib
 import json
 import math
 import os
 import random
 import sys
 
+import json
+import socket
+import threading
+
 import pygame
+
 
 # ============================================================ config
 TILE = 16
 VIEW_W, VIEW_H = 480, 320
 SCALE = 2
 WIN_W, WIN_H = VIEW_W * SCALE, VIEW_H * SCALE
-MAP_W, MAP_H = 64, 48
+NO_HUD_DEFAULT = False   # build_exes.py flips this for the No-HUD PC build
+NO_HUD = NO_HUD_DEFAULT or ("--no-hud" in sys.argv)
+NET_PORT = 7788
+GAME_BUILD_DEFAULT = "host"   # build_exes.py flips this to "player" for the join-only build
+GAME_BUILD = "player" if "--player" in sys.argv else GAME_BUILD_DEFAULT
+CAN_HOST = GAME_BUILD == "host"
+MAP_W, MAP_H = 128, 96
 FPS = 60
-SAVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "farm_cooking_save.json")
+ANDROID = "ANDROID_ARGUMENT" in os.environ or "ANDROID_PRIVATE" in os.environ
+_SAVE_DIR = os.environ.get("ANDROID_PRIVATE") if ANDROID else os.path.dirname(os.path.abspath(__file__))
+SAVE_FILE = os.path.join(_SAVE_DIR or ".", "farm_cooking_save.json")
 MIN_PER_SEC = 3.0            # game minutes per real second
 WAKE_HOUR, PASSOUT_HOUR = 6.0, 26.0
 SEASONS = ["Spring", "Summer", "Fall"]
 DAYS_PER_SEASON = 10
 GRASS, PATH, WATER, SAND = 0, 1, 2, 3
+WOOD_FLOOR, WALL = 4, 5
+BRIDGE = 6                    # the one wooden bridge over the river
+BRIDGE_ROWS = (43, 46)       # first and last row of the bridge deck
+RX0, RY0, RX1, RY1 = 20, 14, 43, 29          # cafe room, inclusive tile bounds
+CAFE_DOOR_IN = (32 * TILE + 8, 28 * TILE + 8)  # inside, next to the exit door
+CAFE_EXIT_OUT = (42 * TILE + 8, 19 * TILE + 10)  # outside, facing the cafe front
+HOUSE_EXIT_OUT = (29 * TILE + 8, 10 * TILE + 10)  # outside, facing the front door of the house
+FARM_DOCK_OUT = (10 * TILE + 8, 36 * TILE + 8)     # back on the farm, facing the dock
+VILLAGE_PORT_TX, VILLAGE_PORT_TY = 121, 43        # the ferry port at the far east end, past the secondary village
+VILLAGE_PORT_OUT = ((VILLAGE_PORT_TX + 2) * TILE + 8, VILLAGE_PORT_TY * TILE + 8)
+PORT_HOUSE_TX, PORT_HOUSE_TY = 120, 48             # the port house on the harbour's south shore
+PORT_HOUSE_OUT = ((PORT_HOUSE_TX + 2) * TILE + 8, (PORT_HOUSE_TY + 5) * TILE + 10)   # outside, facing its door
+STATION_SPAWN = (25 * TILE + 8, 37 * TILE + 8)     # at the Ruined Station dock, facing the boat
+ISLAND_SPAWN = (34 * TILE + 8, 47 * TILE + 8)      # on the island, facing the return dock
+NEAR_DISTANCE = 420                                 # players further away than this are not sent
+ROOM_SIZE = 100                                     # players in one room, the host included
+MAX_PLAYERS = ROOM_SIZE - 1                         # LAN clients (the host is the one more)
+FISH_MASTER_LINES = [
+    "Every fish out here has a story. Bring me yours.",
+    "Catch every species and I'll give you the Master Rod.",
+    "Rare fish bite hardest when you cast perfectly.",
+    "I pay a fair price for a fair catch.",
+]
+FISHERMAN_LINES = [
+    "The river's been good to me. Cross the bridge to reach the village.",
+    "Fish bite best at dawn, right beside the bridge posts.",
+    "Got a Villager House Kit? Build it anywhere on the farm.",
+    "Mind the water. Only the bridge crosses the river here.",
+]
+MASTERY = [(3, "Fish Apprentice", 0.10), (6, "Fish Master", 0.20), (8, "Grand Angler", 0.30)]
+# Next to the .exe when packaged (the code itself runs from a temp folder), else next to main.py
+APP_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+TEXTURE_DIRS = []   # folders that contain PNG texture overrides (from mods)
+LOADED_MODS = []
+_TEX_CACHE = {}
+WORKBENCH = {
+    "computer": dict(name="Computer", needs={"wood": 10, "stone": 6},
+                     desc="Built for the house. Unlocks the PC in your bedroom."),
+    "can2": dict(name="Big Watering Can", needs={"wood": 6, "stone": 3},
+                 desc="Holds 40 water instead of 20."),
+    "hook": dict(name="Fishing Hook", needs={"wood": 4, "stone": 2},
+                 desc="+5% chance of rare fish."),
+    "villager_house": dict(name="Build Villager House", needs={"wood": 30, "stone": 20},
+                 desc="Crafts a house kit. Place it on the farm, then pick a spot."),
+}
+
+
+def tex(name, size=16):
+    """A texture override PNG from a loaded mod, or None to use the built-in art."""
+    key = (name, size)
+    if key in _TEX_CACHE:
+        return _TEX_CACHE[key]
+    result = None
+    for folder in TEXTURE_DIRS:
+        path = os.path.join(folder, name + ".png")
+        if os.path.isfile(path):
+            try:
+                img = pygame.image.load(path)
+                if img.get_size() != (size, size):
+                    img = pygame.transform.scale(img, (size, size))
+                try:
+                    img = img.convert_alpha()
+                except pygame.error:
+                    pass
+                result = img
+            except pygame.error:
+                result = None
+            break
+    _TEX_CACHE[key] = result
+    return result
+
+
+def apply_mod(data, folder):
+    """Adds crops, items, and recipes described in mod.json. Raises ValueError on bad data."""
+    ov = data.get("overrides", {})
+    for key, o in ov.get("crops", {}).items():
+        if key not in CROPS:
+            raise ValueError("override for unknown crop %r" % key)
+        c = CROPS[key]
+        if "name" in o:
+            c["name"] = str(o["name"])[:30]
+        for field in ("days", "seed", "sell"):
+            if field in o:
+                c[field] = max(1 if field == "days" else 0, int(o[field]))
+        c["days"] = min(30, c["days"])
+        if o.get("shape") in ("root", "round", "wheat", "big"):
+            c["shape"] = o["shape"]
+        ITEMS[key]["name"], ITEMS[key]["sell"] = c["name"], c["sell"]
+        seed = ITEMS[key + "_seed"]
+        seed["name"], seed["buy"], seed["sell"] = c["name"] + " Seeds", c["seed"], c["seed"] // 2
+    for key, o in ov.get("items", {}).items():
+        if key not in ITEMS:
+            raise ValueError("override for unknown item %r" % key)
+        it = ITEMS[key]
+        if "name" in o:
+            it["name"] = str(o["name"])[:30]
+        if "sell" in o:
+            it["sell"] = max(0, int(o["sell"]))
+        if it["kind"] == "crop" and key in CROPS:
+            CROPS[key]["sell"] = it["sell"]   # keep the crop and its item price in step
+    for key, c in data.get("crops", {}).items():
+        if key in CROPS:
+            raise ValueError("crop %r already exists" % key)
+        CROPS[key] = dict(name=c["name"], days=int(c["days"]), sell=int(c["sell"]), seed=int(c["seed"]),
+                          fruit=tuple(c.get("fruit", [200, 200, 120])), shape=c.get("shape", "round"))
+        ITEMS[key + "_seed"] = dict(name=c["name"] + " Seeds", kind="seed", sell=int(c["seed"]) // 2,
+                                    crop=key, buy=int(c["seed"]))
+        ITEMS[key] = dict(name=c["name"], kind="crop", sell=int(c["sell"]))
+    for key, it in data.get("items", {}).items():
+        ITEMS[key] = dict(name=it["name"], kind=it.get("kind", "mat"), sell=int(it.get("sell", 0)),
+                          energy=int(it.get("energy", 0)))
+    for key, r in data.get("recipes", {}).items():
+        for ing in r["needs"]:
+            if ing not in ITEMS:
+                raise ValueError("recipe %r needs unknown item %r" % (key, ing))
+        RECIPES[key] = dict(name=r["name"], needs=dict(r["needs"]), energy=int(r.get("energy", 0)),
+                            sell=int(r.get("sell", 0)))
+        ITEMS[key] = dict(name=r["name"], kind="food", sell=RECIPES[key]["sell"], energy=RECIPES[key]["energy"])
+        if r.get("start"):
+            UNLOCKED_START.append(key)
+        else:
+            RECIPE_PRICE[key] = int(r.get("price", 300))
+    for key, f in data.get("fish", {}).items():
+        if key in FISH:
+            raise ValueError("fish %r already exists" % key)
+        FISH[key] = dict(name=f["name"], sell=int(f.get("sell", 50)), weight=int(f.get("weight", 10)),
+                         tier=max(0, min(4, int(f.get("tier", 0)))),
+                         color=tuple(f.get("color", [120, 150, 190])))
+        ITEMS[key] = dict(name=f["name"], kind="mat", sell=FISH[key]["sell"], energy=0)
+    tex_dir = os.path.join(folder, "textures")
+    if os.path.isdir(tex_dir):
+        TEXTURE_DIRS.append(tex_dir)
+
+
+def load_mods(folder=None):
+    """Loads every folder in mods/ that has a mod.json. A broken mod is skipped, not fatal."""
+    folder = folder or os.path.join(APP_DIR, "mods")
+    if not os.path.isdir(folder):
+        return LOADED_MODS
+    for name in sorted(os.listdir(folder)):
+        path = os.path.join(folder, name)
+        meta = os.path.join(path, "mod.json")
+        if not os.path.isfile(meta):
+            continue
+        try:
+            with open(meta, encoding="utf-8") as f:
+                data = json.load(f)
+            apply_mod(data, path)
+            LOADED_MODS.append(data.get("name", name))
+        except (ValueError, KeyError, TypeError, OSError) as e:
+            print("Mod %s was skipped: %s" % (name, e))
+    return LOADED_MODS
 DIRS = {"down": (0, 1), "up": (0, -1), "left": (-1, 0), "right": (1, 0)}
 
 INK = (52, 36, 28)
@@ -75,7 +242,139 @@ CROPS = {
     "potato": dict(name="Potato", days=6, sell=80, seed=40, fruit=(190, 146, 92), shape="round"),
     "tomato": dict(name="Tomato", days=8, sell=120, seed=60, fruit=(222, 60, 50), shape="round"),
     "pumpkin": dict(name="Pumpkin", days=10, sell=300, seed=100, fruit=(236, 126, 40), shape="big"),
+    "strawberry": dict(name="Strawberry", days=5, sell=90, seed=35, fruit=(220, 40, 70), shape="round"),
+    "corn": dict(name="Corn", days=7, sell=160, seed=50, fruit=(250, 220, 70), shape="wheat"),
+    "cabbage": dict(name="Cabbage", days=4, sell=55, seed=25, fruit=(150, 210, 120), shape="round"),
+    "eggplant": dict(name="Eggplant", days=9, sell=260, seed=90, fruit=(110, 50, 120), shape="round"),
 }
+CROPS.update({
+    "radish": dict(name="Radish", days=3, sell=35, seed=12, fruit=(120, 141, 168), shape="leaf"),
+    "onion": dict(name="Onion", days=4, sell=43, seed=16, fruit=(221, 225, 66), shape="bush"),
+    "garlic": dict(name="Garlic", days=5, sell=52, seed=20, fruit=(147, 213, 199), shape="stalk"),
+    "leek": dict(name="Leek", days=6, sell=60, seed=24, fruit=(232, 167, 186), shape="bulb"),
+    "beet": dict(name="Beet", days=7, sell=68, seed=28, fruit=(230, 185, 190), shape="pod"),
+    "carrot": dict(name="Carrot", days=8, sell=77, seed=32, fruit=(202, 121, 40), shape="spike"),
+    "spinach": dict(name="Spinach", days=9, sell=85, seed=36, fruit=(247, 80, 68), shape="round"),
+    "lettuce": dict(name="Lettuce", days=10, sell=94, seed=40, fruit=(163, 85, 155), shape="root"),
+    "kale": dict(name="Kale", days=11, sell=102, seed=44, fruit=(92, 185, 120), shape="wheat"),
+    "broccoli": dict(name="Broccoli", days=12, sell=110, seed=48, fruit=(143, 161, 104), shape="big"),
+    "cauliflower": dict(name="Cauliflower", days=13, sell=119, seed=52, fruit=(179, 151, 136), shape="leaf"),
+    "celery": dict(name="Celery", days=14, sell=127, seed=56, fruit=(221, 223, 59), shape="bush"),
+    "artichoke": dict(name="Artichoke", days=3, sell=136, seed=60, fruit=(177, 82, 182), shape="stalk"),
+    "asparagus": dict(name="Asparagus", days=4, sell=144, seed=64, fruit=(227, 134, 113), shape="bulb"),
+    "peas": dict(name="Peas", days=5, sell=152, seed=68, fruit=(207, 96, 187), shape="pod"),
+    "green_beans": dict(name="Green Beans", days=6, sell=161, seed=72, fruit=(169, 66, 134), shape="spike"),
+    "cucumber": dict(name="Cucumber", days=7, sell=169, seed=76, fruit=(183, 178, 148), shape="round"),
+    "zucchini": dict(name="Zucchini", days=8, sell=178, seed=80, fruit=(113, 162, 189), shape="root"),
+    "watermelon": dict(name="Watermelon", days=9, sell=186, seed=84, fruit=(231, 187, 69), shape="wheat"),
+    "melon": dict(name="Melon", days=10, sell=194, seed=88, fruit=(198, 189, 193), shape="big"),
+    "grapes": dict(name="Grapes", days=11, sell=203, seed=92, fruit=(215, 161, 174), shape="leaf"),
+    "blueberry": dict(name="Blueberry", days=12, sell=211, seed=96, fruit=(156, 167, 184), shape="bush"),
+    "raspberry": dict(name="Raspberry", days=13, sell=220, seed=100, fruit=(212, 191, 172), shape="stalk"),
+    "blackberry": dict(name="Blackberry", days=14, sell=228, seed=104, fruit=(96, 207, 97), shape="bulb"),
+    "cranberry": dict(name="Cranberry", days=3, sell=236, seed=108, fruit=(123, 72, 173), shape="pod"),
+    "orange": dict(name="Orange", days=4, sell=245, seed=112, fruit=(116, 219, 149), shape="spike"),
+    "lemon": dict(name="Lemon", days=5, sell=253, seed=116, fruit=(210, 96, 163), shape="round"),
+    "peach": dict(name="Peach", days=6, sell=262, seed=120, fruit=(148, 91, 156), shape="root"),
+    "plum": dict(name="Plum", days=7, sell=270, seed=124, fruit=(210, 199, 104), shape="wheat"),
+    "cherry": dict(name="Cherry", days=8, sell=278, seed=128, fruit=(233, 162, 118), shape="big"),
+    "pear": dict(name="Pear", days=9, sell=287, seed=132, fruit=(230, 225, 168), shape="leaf"),
+    "kiwi": dict(name="Kiwi", days=10, sell=295, seed=136, fruit=(212, 162, 150), shape="bush"),
+    "pineapple": dict(name="Pineapple", days=11, sell=304, seed=140, fruit=(141, 135, 108), shape="stalk"),
+    "coffee_beans": dict(name="Coffee Beans", days=12, sell=312, seed=144, fruit=(92, 68, 78), shape="bulb"),
+    "rice": dict(name="Rice", days=13, sell=320, seed=148, fruit=(242, 177, 173), shape="pod"),
+    "barley": dict(name="Barley", days=14, sell=329, seed=152, fruit=(215, 152, 91), shape="spike"),
+    "oats": dict(name="Oats", days=3, sell=337, seed=156, fruit=(156, 184, 159), shape="round"),
+    "rye": dict(name="Rye", days=4, sell=346, seed=160, fruit=(220, 187, 151), shape="root"),
+    "millet": dict(name="Millet", days=5, sell=354, seed=164, fruit=(232, 229, 48), shape="wheat"),
+    "sorghum": dict(name="Sorghum", days=6, sell=362, seed=168, fruit=(164, 141, 157), shape="big"),
+    "quinoa": dict(name="Quinoa", days=7, sell=371, seed=172, fruit=(115, 172, 171), shape="leaf"),
+    "chili_pepper": dict(name="Chili Pepper", days=8, sell=379, seed=176, fruit=(156, 175, 86), shape="bush"),
+    "bell_pepper": dict(name="Bell Pepper", days=9, sell=388, seed=180, fruit=(198, 182, 56), shape="stalk"),
+    "ginger": dict(name="Ginger", days=10, sell=396, seed=184, fruit=(158, 187, 134), shape="bulb"),
+    "sweet_potato": dict(name="Sweet Potato", days=11, sell=404, seed=188, fruit=(114, 109, 145), shape="pod"),
+    "cassava": dict(name="Cassava", days=12, sell=413, seed=192, fruit=(127, 175, 43), shape="spike"),
+    "yam": dict(name="Yam", days=13, sell=421, seed=196, fruit=(113, 60, 155), shape="round"),
+    "sunflower": dict(name="Sunflower", days=14, sell=430, seed=200, fruit=(238, 199, 61), shape="root"),
+    "lavender": dict(name="Lavender", days=3, sell=438, seed=204, fruit=(246, 110, 103), shape="wheat"),
+    "hops": dict(name="Hops", days=4, sell=446, seed=208, fruit=(120, 218, 51), shape="big"),
+    "cotton": dict(name="Cotton", days=5, sell=455, seed=212, fruit=(229, 128, 131), shape="leaf"),
+    "cocoa": dict(name="Cocoa", days=6, sell=463, seed=216, fruit=(129, 61, 120), shape="bush"),
+    "vanilla": dict(name="Vanilla", days=7, sell=472, seed=220, fruit=(239, 207, 165), shape="stalk"),
+    "saffron": dict(name="Saffron", days=8, sell=480, seed=224, fruit=(124, 199, 97), shape="bulb"),
+    "mint": dict(name="Mint", days=9, sell=488, seed=228, fruit=(211, 210, 73), shape="pod"),
+    "basil": dict(name="Basil", days=10, sell=497, seed=232, fruit=(243, 189, 114), shape="spike"),
+    "rosemary": dict(name="Rosemary", days=11, sell=505, seed=236, fruit=(111, 166, 80), shape="round"),
+    "thyme": dict(name="Thyme", days=12, sell=514, seed=240, fruit=(124, 210, 118), shape="root"),
+    "chamomile": dict(name="Chamomile", days=13, sell=522, seed=244, fruit=(219, 165, 139), shape="wheat"),
+})
+
+# ---------- fish species: weight is how common they are, tier is how rare (0 = common)
+FISH = {
+    "fish": dict(name="Fish", sell=45, weight=40, tier=0, color=(120, 150, 190)),
+    "trout": dict(name="Trout", sell=70, weight=24, tier=1, color=(150, 200, 170)),
+    "bass": dict(name="Bass", sell=95, weight=16, tier=1, color=(120, 170, 110)),
+    "catfish": dict(name="Catfish", sell=130, weight=9, tier=2, color=(110, 110, 120)),
+    "salmon": dict(name="Salmon", sell=180, weight=6, tier=2, color=(240, 130, 110)),
+    "eel": dict(name="Eel", sell=200, weight=4, tier=3, color=(90, 110, 70)),
+    "koi": dict(name="Koi", sell=420, weight=2, tier=4, color=(250, 140, 60)),
+    "rare_fish": dict(name="Golden Carp", sell=320, weight=1, tier=4, color=(250, 200, 60)),
+}
+FISH.update({
+    "perch": dict(name="Perch", sell=40, weight=28, tier=0, color=(118, 174, 174)),
+    "pike": dict(name="Pike", sell=43, weight=28, tier=0, color=(154, 207, 129)),
+    "common_carp": dict(name="Common Carp", sell=46, weight=28, tier=0, color=(146, 197, 70)),
+    "sturgeon": dict(name="Sturgeon", sell=49, weight=28, tier=0, color=(174, 231, 219)),
+    "sunfish": dict(name="Sunfish", sell=52, weight=28, tier=0, color=(200, 159, 213)),
+    "bluegill": dict(name="Bluegill", sell=55, weight=28, tier=0, color=(133, 90, 89)),
+    "crappie": dict(name="Crappie", sell=58, weight=28, tier=0, color=(237, 79, 145)),
+    "walleye": dict(name="Walleye", sell=61, weight=28, tier=0, color=(86, 60, 224)),
+    "muskie": dict(name="Muskie", sell=64, weight=28, tier=0, color=(207, 146, 133)),
+    "tuna": dict(name="Tuna", sell=67, weight=28, tier=0, color=(209, 128, 87)),
+    "mackerel": dict(name="Mackerel", sell=40, weight=28, tier=0, color=(221, 230, 113)),
+    "sardine": dict(name="Sardine", sell=43, weight=28, tier=0, color=(139, 188, 92)),
+    "anchovy": dict(name="Anchovy", sell=46, weight=28, tier=0, color=(166, 210, 68)),
+    "herring": dict(name="Herring", sell=49, weight=28, tier=0, color=(149, 216, 97)),
+    "cod": dict(name="Cod", sell=52, weight=28, tier=0, color=(207, 194, 79)),
+    "haddock": dict(name="Haddock", sell=55, weight=28, tier=0, color=(199, 199, 229)),
+    "halibut": dict(name="Halibut", sell=58, weight=28, tier=0, color=(130, 236, 187)),
+    "flounder": dict(name="Flounder", sell=61, weight=28, tier=0, color=(84, 200, 175)),
+    "sole": dict(name="Sole", sell=102, weight=14, tier=1, color=(103, 62, 172)),
+    "red_snapper": dict(name="Red Snapper", sell=106, weight=14, tier=1, color=(125, 115, 228)),
+    "grouper": dict(name="Grouper", sell=70, weight=14, tier=1, color=(204, 158, 82)),
+    "mahi_mahi": dict(name="Mahi-Mahi", sell=74, weight=14, tier=1, color=(156, 105, 182)),
+    "marlin": dict(name="Marlin", sell=78, weight=14, tier=1, color=(76, 197, 160)),
+    "swordfish": dict(name="Swordfish", sell=82, weight=14, tier=1, color=(203, 141, 138)),
+    "barracuda": dict(name="Barracuda", sell=86, weight=14, tier=1, color=(108, 84, 104)),
+    "wahoo": dict(name="Wahoo", sell=90, weight=14, tier=1, color=(91, 201, 209)),
+    "clownfish": dict(name="Clownfish", sell=94, weight=14, tier=1, color=(68, 61, 180)),
+    "angelfish": dict(name="Angelfish", sell=98, weight=14, tier=1, color=(210, 127, 225)),
+    "tang": dict(name="Tang", sell=102, weight=14, tier=1, color=(128, 62, 103)),
+    "goby": dict(name="Goby", sell=106, weight=14, tier=1, color=(238, 90, 224)),
+    "guppy": dict(name="Guppy", sell=70, weight=14, tier=1, color=(187, 158, 91)),
+    "betta": dict(name="Betta", sell=74, weight=14, tier=1, color=(227, 229, 187)),
+    "goldfish": dict(name="Goldfish", sell=132, weight=6, tier=2, color=(163, 168, 162)),
+    "tetra": dict(name="Tetra", sell=138, weight=6, tier=2, color=(173, 147, 210)),
+    "discus": dict(name="Discus", sell=144, weight=6, tier=2, color=(233, 223, 220)),
+    "lamprey": dict(name="Lamprey", sell=150, weight=6, tier=2, color=(200, 151, 233)),
+    "gar": dict(name="Gar", sell=156, weight=6, tier=2, color=(198, 214, 189)),
+    "bowfin": dict(name="Bowfin", sell=162, weight=6, tier=2, color=(73, 216, 73)),
+    "paddlefish": dict(name="Paddlefish", sell=168, weight=6, tier=2, color=(155, 133, 208)),
+    "arowana": dict(name="Arowana", sell=174, weight=6, tier=2, color=(190, 238, 171)),
+    "piranha": dict(name="Piranha", sell=200, weight=3, tier=3, color=(98, 233, 133)),
+    "stingray": dict(name="Stingray", sell=208, weight=3, tier=3, color=(229, 185, 235)),
+    "manta_ray": dict(name="Manta Ray", sell=216, weight=3, tier=3, color=(161, 63, 131)),
+    "lungfish": dict(name="Lungfish", sell=224, weight=3, tier=3, color=(185, 151, 192)),
+    "sea_bass": dict(name="Sea Bass", sell=232, weight=3, tier=3, color=(223, 182, 100)),
+    "monkfish": dict(name="Monkfish", sell=240, weight=3, tier=3, color=(95, 143, 80)),
+    "dorado": dict(name="Dorado", sell=400, weight=1, tier=4, color=(132, 128, 137)),
+    "pollock": dict(name="Pollock", sell=420, weight=1, tier=4, color=(169, 100, 202)),
+    "lingcod": dict(name="Lingcod", sell=320, weight=1, tier=4, color=(211, 173, 205)),
+    "lake_trout": dict(name="Lake Trout", sell=340, weight=1, tier=4, color=(102, 82, 178)),
+    "rainbow_trout": dict(name="Rainbow Trout", sell=360, weight=1, tier=4, color=(78, 146, 84)),
+    "brook_trout": dict(name="Brook Trout", sell=380, weight=1, tier=4, color=(158, 230, 214)),
+    "steelhead": dict(name="Steelhead", sell=400, weight=1, tier=4, color=(111, 217, 93)),
+})
 RECIPES = {
     "fried_egg": dict(name="Fried Egg", needs={"egg": 1}, energy=30, sell=50),
     "tea": dict(name="Wildflower Tea", needs={"flower": 2}, energy=25, sell=60),
@@ -84,9 +383,22 @@ RECIPES = {
     "soup": dict(name="Tomato Soup", needs={"tomato": 2}, energy=65, sell=320),
     "pie": dict(name="Pumpkin Pie", needs={"pumpkin": 1, "wheat": 1, "egg": 1}, energy=100, sell=700),
 }
-TOOLS = ["hoe", "can", "axe", "pick"]
-TOOL_NAMES = {"hoe": "Hoe", "can": "Watering Can", "axe": "Axe", "pick": "Pickaxe"}
-TOOL_COST = {"hoe": 2, "can": 1, "axe": 3, "pick": 3}
+RECIPES.update({
+    "pancakes": dict(name="Pancakes", needs={"flour": 1, "egg": 1, "milk": 1}, energy=55, sell=150),
+    "latte": dict(name="Flower Latte", needs={"flower": 2, "milk": 1}, energy=40, sell=140),
+    "cake": dict(name="Honey Cake", needs={"flour": 2, "egg": 2, "sugar": 1, "milk": 1}, energy=80, sell=380),
+    "pumpkin_latte": dict(name="Pumpkin Latte", needs={"pumpkin": 1, "milk": 1, "sugar": 1}, energy=70, sell=330),
+    "grilled_fish": dict(name="Grilled Fish", needs={"fish": 1}, energy=50, sell=130),
+    "fish_stew": dict(name="Fish Stew", needs={"fish": 1, "potato": 1, "tomato": 1}, energy=75, sell=300),
+    "salad": dict(name="Garden Salad", needs={"cabbage": 2, "tomato": 1}, energy=45, sell=190),
+    "ratatouille": dict(name="Ratatouille", needs={"eggplant": 1, "tomato": 1, "pumpkin": 1}, energy=110, sell=800),
+    "corn_bread": dict(name="Corn Bread", needs={"corn": 2, "egg": 1}, energy=60, sell=240),
+    "strawberry_tart": dict(name="Strawberry Tart", needs={"strawberry": 2, "flour": 1, "sugar": 1}, energy=75, sell=420),
+    "fish_platter": dict(name="Fish Platter", needs={"salmon": 1, "trout": 1, "bass": 1}, energy=90, sell=520),
+})
+TOOLS = ["hoe", "can", "axe", "pick", "rod"]
+TOOL_NAMES = {"hoe": "Hoe", "can": "Watering Can", "axe": "Axe", "pick": "Pickaxe", "rod": "Fishing Rod"}
+TOOL_COST = {"hoe": 2, "can": 1, "axe": 3, "pick": 3, "rod": 2}
 
 ITEMS = {}
 for _t in TOOLS:
@@ -101,9 +413,258 @@ ITEMS.update({
     "stone": dict(name="Stone", kind="mat", sell=6),
     "egg": dict(name="Egg", kind="mat", sell=25),
     "flower": dict(name="Wildflower", kind="mat", sell=12),
+    "fish": dict(name="Fish", kind="mat", sell=45),
+    "rare_fish": dict(name="Golden Carp", kind="mat", sell=320),
+    "villager_house_kit": dict(name="Villager House Kit", kind="mat", sell=0),
+    "scrap": dict(name="Scrap Metal", kind="mat", sell=14),
+    "old_coin": dict(name="Old Coin", kind="mat", sell=90),
+    "trout": dict(name="Trout", kind="mat", sell=70),
+    "bass": dict(name="Bass", kind="mat", sell=95),
+    "catfish": dict(name="Catfish", kind="mat", sell=130),
+    "salmon": dict(name="Salmon", kind="mat", sell=180),
+    "eel": dict(name="Eel", kind="mat", sell=200),
+    "koi": dict(name="Koi", kind="mat", sell=420),
+    "flour": dict(name="Flour", kind="mat", sell=15),
+    "milk": dict(name="Milk", kind="mat", sell=18),
+    "sugar": dict(name="Sugar", kind="mat", sell=12),
+    "ticket": dict(name="Arcade Ticket", kind="mat", sell=0),
 })
 for _k, _r in RECIPES.items():
     ITEMS[_k] = dict(name=_r["name"], kind="food", sell=_r["sell"], energy=_r["energy"])
+ITEMS["energy_bar"] = dict(name="Energy Bar", kind="food", sell=0, energy=60)
+for _fk, _fv in FISH.items():                        # every fish is an item you can hold and sell
+    if _fk not in ITEMS:
+        ITEMS[_fk] = dict(name=_fv["name"], kind="mat", sell=_fv["sell"])
+
+# ---- cafe / PC shop / arcade data
+UNLOCKED_START = ["fried_egg", "tea", "bread"]
+RECIPE_PRICE = {
+    "salad": 200, "ratatouille": 900, "corn_bread": 260, "strawberry_tart": 480, "fish_platter": 550,"latte": 250, "grilled_fish": 150, "stew": 300, "pancakes": 350, "soup": 400,
+                "fish_stew": 500, "pumpkin_latte": 600, "pie": 700, "cake": 800}
+PANTRY = {"flour": 25, "milk": 30, "sugar": 20}
+UPGRADES = {
+    "table3": dict(name="Cafe table #3", price=600, desc="One more seat for hungry guests", icon="wood"),
+    "table4": dict(name="Cafe table #4", price=1200, desc="A fourth table (needs table #3)", icon="wood"),
+    "decor": dict(name="Cafe decor pack", price=500, desc="Guests tip 25% more", icon="flower"),
+    "can2": dict(name="Big watering can", price=400, desc="Holds 40 water instead of 20", icon="can"),
+    "tonic1": dict(name="Energy tonic I", price=500, desc="+25 max energy", icon="energy_bar"),
+    "tonic2": dict(name="Energy tonic II", price=900, desc="+25 max energy (needs tonic I)", icon="energy_bar"),
+    "tonic3": dict(name="Energy tonic III", price=1500, desc="+25 max energy (needs tonic II)", icon="energy_bar"),
+    "tools": dict(name="Efficient tools", price=700, desc="Every tool costs 1 less energy", icon="pick"),
+}
+UPG_REQ = {"table4": "table3", "tonic2": "tonic1", "tonic3": "tonic2"}
+MINI = {
+    "veggie": dict(name="Veggie Catch", desc="Move the basket. Catch veggies, dodge rocks!", icon="tomato"),
+    "weed": dict(name="Whack-a-Weed", desc="Tap the weeds. Spare the flowers!", icon="flower"),
+    "memory": dict(name="Recipe Memory", desc="Repeat the ingredient order.", icon="egg"),
+    "pyramid": dict(name="Pyramid Builder", desc="Egypt: stack blocks. Stay centered!", icon="stone"),
+    "quiz": dict(name="Food History Quiz", desc="How well do you know food history?", icon="wheat"),
+    "caravan": dict(name="Silk Road Caravan", desc="Collect spices, dodge bandits.", icon="sugar"),
+}
+PRIZES = {
+    "p_seeds": dict(name="Mystery Seed Pack", cost=10, desc="3 random seed packets", icon="wheat_seed"),
+    "p_bar": dict(name="Energy Bar", cost=6, desc="Restores 60 energy", icon="energy_bar"),
+    "p_trophy": dict(name="Golden Fork Trophy", cost=40, desc="+15 cafe rating, guests pay 10% more", icon="coin"),
+}
+PLAY_COST = 20
+MEM_CENTERS = [(450, 200), (580, 330), (450, 460), (320, 330)]
+MEM_ICONS = ["tomato", "pumpkin", "egg", "wheat"]
+MEM_COLS = [(220, 70, 60), (236, 130, 40), (240, 240, 230), (232, 196, 84)]
+
+CRAZY_LINES = [
+    "Hi! I made this whole game. Bring me every single item you can collect, and I'll make one of your wishes come true.",
+    "Still collecting? Good. The more you bring me, the bigger the wish.",
+    "I don't do refunds on wishes. Or on anything else.",
+    "Shh. The fish in the harbour are my spies.",
+]
+PORTRAITS = {}                  # name -> picture shown in the dialog box, when we have one
+CRAZY_ART_RECT = (270, 165, 205, 225)   # the drawn character inside crazy_dew.png
+WISH_OPTIONS = [                # (key, title, what you get). Each wish can be made only once.
+    ("gold", "A fortune", "+1500 gold"),
+    ("stamina", "Iron stamina", "+40 max energy, fully rested"),
+    ("recipes", "Master cook", "Every cafe recipe unlocked"),
+    ("seeds", "Seed vault", "5 packets of every crop seed"),
+    ("rare", "Golden hoard", "5 Golden Carp"),
+    ("kits", "Village builder", "2 villager house kits"),
+    ("skills", "Old wisdom", "+200 xp in farming, cooking and fishing"),
+]
+GUS_LINES = [
+    "Flour on my apron, sugar in my heart. What are we baking today?",
+    "Bread rises best when nobody watches it. Like children.",
+    "Hit the golden spot on the oven and the crust comes out perfect.",
+    "Honey cake for the cafe tomorrow. Shh, it's a secret.",
+]
+LILA_LINES = [
+    "Every seed wants water and a little patience.",
+    "The pumpkins are sulking. Bring them a little love?",
+    "Pull the weeds before they start gossiping with the crops.",
+    "I grew this sunflower from a pinch of dirt. Don't tell anyone.",
+]
+PIP_LINES = [
+    "Can I pet the hens? Pleeease?",
+    "I saw a golden fish in the river once. Maybe.",
+    "Mabel says I'm not allowed near the bridge. I'm only a little allowed.",
+    "Grown-ups count money. I count frogs.",
+]
+TOMAS_LINES = [
+    "Good timber takes a season to dry. Patience, friend.",
+    "Stone walls keep the wind out and the gossip in.",
+    "This bridge has stood for years, mostly because I keep fixing it.",
+    "Build a villager house with a kit and I'll help with the walls.",
+]
+DARIO_LINES = [
+    "The ferry leaves when the tide says so. Also when I say so.",
+    "Bring me an old coin and I'll row you across, friend.",
+    "The river's calm today. Keep your hands inside the boat.",
+    "Tell the old salt at the station I said hello. Or don't.",
+]
+SALT_LINES = [
+    "Ruins are full of scrap if you dig deep enough.",
+    "I've been searching these ruins for forty years. Still finding things.",
+    "The sea took my ship. The ruins took my hat.",
+    "Coins wash up after storms. Keep your eyes open.",
+]
+CORAL_LINES = [
+    "Shells for sale? No? Keep looking, they're everywhere.",
+    "The sun is wonderful here. Come and sit awhile.",
+    "I cook trout in seaweed. Secret recipe.",
+    "Don't step on the sand crabs. They're very proud.",
+]
+
+
+def _q(id, giver, title, text, offer, thanks, goal, gold=0, item=None, n=1):
+    return dict(id=id, giver=giver, title=title, text=text, offer=offer, thanks=thanks,
+                goal=goal, gold=gold, item=item, n=n)
+
+
+# goal kinds: ("stat", counter, n) counts from the day the quest was taken,
+# ("items", {item: n}) takes the items on turn-in, ("money", n), ("level", skill, n),
+# ("fishkinds", n).
+QUESTS = [
+    _q("m1", "Mabel", "Seed Order", "Plant 6 seeds in the soil.",
+       "Fresh seeds need fresh soil! Plant six of them and I'll pay you well.",
+       "Look at those rows! Here's your pay.", ("stat", "plant", 6), gold=80),
+    _q("m2", "Mabel", "Market Day", "Have 400 gold in your purse.",
+       "Business is booming. Show me you can keep a purse full and I'll reward you.",
+       "A fine bit of saving! Take these seeds on the house.", ("money", 400), gold=60,
+       item="parsnip_seed", n=5),
+    _q("m3", "Mabel", "Good Business", "Ship 10 items to the shipping bin.",
+       "Ship goods to the bin by the house. Ten items, mind you.",
+       "Shipping like a pro! Your reward is in the till.", ("stat", "ship", 10), gold=150),
+    _q("f1", "Fern", "Wildflower Tea", "Bring Fern 4 wildflowers.",
+       "Wildflower tea cures most things. Bring me four flowers and I'll share my recipe.",
+       "Ah, lovely! The kettle is already warm. Take this for your trouble.",
+       ("items", {"flower": 4}), gold=60),
+    _q("f2", "Fern", "Harvest Season", "Harvest 12 crops from your fields.",
+       "The fields want picking. Harvest twelve crops and the valley will smile.",
+       "Twelve crops! You've got a farmer's hands.", ("stat", "harvest", 12), gold=120),
+    _q("f3", "Fern", "Old Hands", "Reach Farming level 3.",
+       "Good farming takes years. Work up to Farming level 3 and I'll teach you the old tricks.",
+       "There it is, Farming level 3. Keep at it.", ("level", "farm", 3), gold=200),
+    _q("fi1", "Fisherman", "First Catch", "Catch 3 fish in the river.",
+       "Cast a line into the river, lad. Three fish and you're a fisher.",
+       "Three fish! Welcome to the river club.", ("stat", "fish", 3), gold=60),
+    _q("fi2", "Fisherman", "Bridge Watch", "Catch 10 fish in total.",
+       "The river is full of fish if you're patient. Ten of them and I'll buy you tea.",
+       "Ten! Your tea is on me, and this is for your trouble.", ("stat", "fish", 10), gold=200),
+    _q("fi3", "Fisherman", "Fish Journal", "Catch 5 different kinds of fish.",
+       "Every fish has a different story. Catch five kinds and I'll reward your curiosity.",
+       "Five different kinds! The journal is getting thick.", ("fishkinds", 5), gold=350),
+    _q("fm1", "Fish Master", "Pink Trade", "Bring the Fish Master a koi.",
+       "Koi are rare and I collect them. Bring me one and I'll pay handsomely.",
+       "Beautiful koi! Your reward, as promised.", ("items", {"koi": 1}), gold=250),
+    _q("fm2", "Fish Master", "Steady Hands", "Reach Fishing level 3.",
+       "A steady hand catches bigger fish. Get your Fishing up to level 3.",
+       "Steady as the tide! Fishing level 3, well done.", ("level", "fish", 3), gold=300),
+    _q("fm3", "Fish Master", "Sea Supper", "Bring the Fish Master 2 salmon and 1 eel.",
+       "I want a proper supper: two salmon and an eel. Bring them and I'll pay.",
+       "A feast! Thank you. Here's the gold.", ("items", {"salmon": 2, "eel": 1}), gold=400),
+    _q("g1", "Gus", "Breakfast Shift", "Cook 3 meals in the kitchen.",
+       "The breakfast rush starts at dawn! Cook three meals for me and I'll pay you.",
+       "Lovely plates! Breakfast is saved.", ("stat", "cook", 3), gold=100),
+    _q("g2", "Gus", "Golden Crust", "Get 2 perfect bakes (three stars).",
+       "A perfect bake has a golden crust. Hit the golden spot twice and I'll reward you.",
+       "Golden crusts, both of them! I'm proud.", ("stat", "perfect", 2), gold=250),
+    _q("g3", "Gus", "Cafe Opening", "Serve 10 guests in your cafe.",
+       "The cafe needs guests. Serve ten of them and the whole town will know your name.",
+       "Ten guests served! The cafe is famous now.", ("stat", "serve", 10), gold=400),
+    _q("l1", "Lila", "Watering Round", "Water your crops 10 times.",
+       "A thirsty field is a sad field. Give the crops ten waterings.",
+       "Sunny and green! Thanks for keeping them happy.", ("stat", "water", 10), gold=70),
+    _q("l2", "Lila", "Pumpkin Patch", "Deliver 3 pumpkins to Lila.",
+       "Pumpkins are my favourite. Bring three and I'll make it worth your while.",
+       "Three fat pumpkins! What a harvest.", ("items", {"pumpkin": 3}), gold=300),
+    _q("l3", "Lila", "Ripe Tomatoes", "Deliver 5 tomatoes to Lila.",
+       "Tomatoes all ripen at once and then I can't keep up. Help me out with five?",
+       "Juicy! That's my salad sorted.", ("items", {"tomato": 5}), gold=200),
+    _q("p1", "Pip", "Chicken Friend", "Pet your hens 5 times.",
+       "Can you help my hens feel loved? Pet them five times? Pleeease?",
+       "Yay! The hens said thank you. Here's a treat.", ("stat", "pet", 5), gold=80),
+    _q("p2", "Pip", "Egg Hunt", "Deliver 10 eggs to Pip.",
+       "I'm collecting eggs for the big egg cake. Ten, please!",
+       "Ten eggs! That's the biggest egg cake ever.", ("items", {"egg": 10}), gold=150),
+    _q("p3", "Pip", "Savings Jar", "Have 1000 gold in your purse.",
+       "My jar needs to be full before Mabel's birthday. Keep a thousand gold, that's a grown-up rule!",
+       "Wow, a thousand! You're rich. Here, take a little back.", ("money", 1000), gold=200),
+    _q("t1", "Tomas", "Lumber Run", "Deliver 20 wood to Tomas.",
+       "Timber is the real gold of this valley. Bring me twenty wood.",
+       "Solid timber! The workshop smells of pine now.", ("items", {"wood": 20}), gold=150),
+    _q("t2", "Tomas", "Stone Walls", "Deliver 15 stone to Tomas.",
+       "Stone walls don't rot. Bring fifteen stone and I'll build something tough.",
+       "Good solid stone. I'll put it to work.", ("items", {"stone": 15}), gold=150),
+    _q("t3", "Tomas", "Home Sweet Home", "Build a villager house on the east bank.",
+       "Build a villager house with a kit, right here on the east bank. Watch the village grow.",
+       "A house! The village grows one roof at a time.", ("stat", "house", 1), gold=500),
+    _q("d1", "Dario", "Ferry Trips", "Take the ferry to the island 2 times.",
+       "Boarding the ferry is simple: stand at the port and press E. Take two trips.",
+       "You're a seasoned sailor now!", ("stat", "sail", 2), gold=120),
+    _q("d2", "Dario", "Ruins Scout", "Search 4 ruins at the Ruined Station.",
+       "The ruins hold things nobody else thought to look for. Search four.",
+       "Four ruins searched! You're a natural.", ("stat", "ruin", 4), gold=300),
+    _q("d3", "Dario", "Ferry Fare", "Deliver 3 old coins to Dario.",
+       "Old coins make good fares. Bring me three and I'll row you anywhere.",
+       "Three coins! Hop aboard any time.", ("items", {"old_coin": 3}), gold=250),
+    _q("s1", "Old Salt", "Scrap Pile", "Deliver 10 scrap metal to Old Salt.",
+       "I'm building a boat out of junk. Bring me ten scrap metal.",
+       "Ten scraps! My boat is coming along.", ("items", {"scrap": 10}), gold=180),
+    _q("s2", "Old Salt", "Ancient Coins", "Deliver 4 old coins to Old Salt.",
+       "Old coins are older than my grandmother's stories. Bring me four.",
+       "Four coins! Ancient treasure, shared.", ("items", {"old_coin": 4}), gold=400),
+    _q("c1", "Coral", "Seashell Shelf", "Deliver 3 trout to Coral.",
+       "Trout from the bay makes a lovely lunch. Bring me three.",
+       "Trout! The shelf is coming along nicely.", ("items", {"trout": 3}), gold=180),
+    _q("c2", "Coral", "Sunny Shore", "Reach Cooking level 3.",
+       "Cooking on the sand is an art. Reach Cooking level 3 and I'll share my secret recipe.",
+       "Level 3! You're a true cook now.", ("level", "cook", 3), gold=350),
+]
+CRAZY_QUESTS = [
+    dict(_q("cd1", "Crazy Dew", "One of Every Crop", "Bring one of every crop you have grown.",
+            "I'm making a list. One of every crop, please. Every single one!",
+            "Every crop! You've got a whole garden in you. Make your wish.",
+            ("items", {k: 1 for k in CROPS})), wish=True),
+    dict(_q("cd2", "Crazy Dew", "One of Every Fish", "Bring one of every kind of fish.",
+            "Now the river. One of every fish I've ever named, and a few I haven't.",
+            "The whole river, in a bucket. Impressive. Make your wish.",
+            ("items", {k: 1 for k in FISH})), wish=True),
+    dict(_q("cd3", "Crazy Dew", "One of Every Dish", "Cook one of every dish in the recipe book.",
+            "Every dish I've ever written down. Cook one of each, then come back.",
+            "Every dish! My stomach is singing. Make your wish.",
+            ("items", {k: 1 for k in RECIPES})), wish=True),
+    dict(_q("cd4", "Crazy Dew", "Mountain of Materials", "Bring 50 stone, 50 wood, 30 scrap, 10 old coins, 30 flowers.",
+            "Build me a mountain! Stone, wood, scrap, coins and flowers. Lots of each.",
+            "A mountain indeed. Make your wish.",
+            ("items", {"stone": 50, "wood": 50, "scrap": 30, "old_coin": 10, "flower": 30})), wish=True),
+    dict(_q("cd5", "Crazy Dew", "Seed Hoard", "Bring 5 seed packets of every crop.",
+            "Seeds, seeds, seeds! Five packets of every crop. Don't worry, I'll give some back.",
+            "Five of each! The seed shelf is full. Make your wish.",
+            ("items", {k + "_seed": 5 for k in CROPS})), wish=True),
+    dict(_q("cd6", "Crazy Dew", "The Rarest Things", "Bring 1 Golden Carp, 1 Koi and 5 old coins.",
+            "Last one. Only the rare things now. Golden Carp, a Koi, five old coins.",
+            "You did it. All of it. Make your final wish.",
+            ("items", {"rare_fish": 1, "koi": 1, "old_coin": 5})), wish=True),
+]
+QUESTS += CRAZY_QUESTS
+QUEST_BY_ID = {q["id"]: q for q in QUESTS}
 
 MABEL_LINES = [
     "Fresh seeds this morning! Parsnips are quick, pumpkins pay best.",
@@ -122,6 +683,16 @@ FERN_LINES = [
 
 
 # ============================================================ helpers
+def river_center(y):
+    """Column of the middle of the river on row y (the river winds left and right)."""
+    return 89 + int(round(3 * math.sin(y / 8.5) + 1.5 * math.sin(y / 3.7)))
+
+
+def east_clear(x, y):
+    """East-bank village land: no rocks or flowers here (trees are removed by x >= 60)."""
+    return 90 <= x <= 127 and 33 <= y <= 52
+
+
 def lerp(a, b, t):
     return a + (b - a) * t
 
@@ -149,7 +720,123 @@ def surf(w, h):
 SPR = {}
 
 
+def draw_fish_icon(s, key, color, tier=0):
+    """Draws one fish. The same key always gives the same fish; different keys look different."""
+    rnd = random.Random(int(hashlib.md5(key.encode()).hexdigest()[:8], 16))
+    base = color
+    belly = lerp_col(base, (255, 255, 246), 0.5)
+    dark = lerp_col(base, (24, 30, 46), 0.42)
+    bw, bh = rnd.randrange(9, 13), rnd.randrange(5, 8)
+    cx, cy = 7, 8
+    tail = rnd.choice(("fork", "round", "fan"))
+    fin = rnd.random() < 0.65
+    pattern = rnd.choice(("plain", "stripes", "spots", "band"))
+    tx = cx + bw // 2 - 1                          # the tail sits behind the body
+    if tail == "fork":
+        pygame.draw.polygon(s, dark, [(tx, cy), (tx + 4, cy - 4), (tx + 3, cy), (tx + 4, cy + 4)])
+    elif tail == "round":
+        pygame.draw.circle(s, base, (tx + 2, cy), 3)
+    else:
+        pygame.draw.polygon(s, base, [(tx, cy), (tx + 4, cy - 3), (tx + 4, cy + 3)])
+    pygame.draw.ellipse(s, base, (cx - bw // 2, cy - bh // 2, bw, bh))
+    pygame.draw.ellipse(s, belly, (cx - bw // 2 + 2, cy, bw - 4, bh // 2 + 1))
+    if fin:
+        pygame.draw.polygon(s, dark, [(cx - 1, cy - bh // 2), (cx + 2, cy - bh // 2 - 3), (cx + 3, cy - bh // 2)])
+    if pattern == "stripes":
+        for x in range(cx - bw // 2 + 3, cx + bw // 2 - 1, 3):
+            s.fill(dark, (x, cy - bh // 2 + 1, 1, bh - 2))
+    elif pattern == "spots":
+        for _ in range(3):
+            x = rnd.randrange(cx - bw // 2 + 2, cx + bw // 2 - 2)
+            y = rnd.randrange(cy - bh // 2 + 1, cy + bh // 2 - 1)
+            s.set_at((x, y), dark)
+    elif pattern == "band":
+        s.fill(dark, (cx - bw // 2, cy - 1, bw, 1))
+    s.set_at((cx - bw // 2 + 2, cy - 1), (20, 20, 30))          # eye
+    if tier >= 3:                                                # rare fish shine
+        s.set_at((cx + 1, cy - bh // 2 + 1), (255, 250, 210))
+        s.set_at((cx + 2, cy - bh // 2 + 1), (255, 250, 210))
+    return (bw, bh, tail, fin, pattern, base)
+
+
+TOOL_ICON_KEYS = ("hoe", "can", "axe", "pick", "rod")
+
+
+def make_tool_icon(key):
+    """Shaded tool icons. Drawn at 3x size with dark outlines, wood grain and steel
+    highlights, then scaled down to 16x16 so the edges come out smooth."""
+    S = 48
+    big = surf(S, S)
+    ink = (52, 36, 28)
+    wood, wood_l, wood_d = (168, 118, 70), (210, 166, 110), (112, 74, 42)
+    steel, steel_l, steel_d = (196, 204, 216), (244, 248, 252), (120, 130, 146)
+
+    def handle(a, b, w):
+        pygame.draw.line(big, ink, a, b, w + 4)
+        pygame.draw.line(big, wood, a, b, w)
+        pygame.draw.line(big, wood_l, (a[0] - 1, a[1] - 1), (b[0] - 1, b[1] - 1), max(1, w // 3))
+        pygame.draw.line(big, wood_d, (a[0] + 2, a[1] + 2), (b[0] + 2, b[1] + 2), max(1, w // 3))
+
+    def solid(pts, fill, edge=ink, w=3):
+        pygame.draw.polygon(big, fill, pts)
+        pygame.draw.polygon(big, edge, pts, w)
+
+    def shine(a, b):
+        pygame.draw.line(big, steel_l, a, b, 2)
+
+    if key == "hoe":
+        handle((8, 44), (26, 22), 5)
+        solid([(22, 22), (40, 10), (46, 16), (36, 30), (26, 30)], steel)
+        shine((41, 12), (45, 16))
+        pygame.draw.line(big, steel_d, (27, 27), (36, 28), 3)
+    elif key == "axe":
+        handle((8, 44), (26, 20), 5)
+        solid([(14, 20), (26, 6), (40, 8), (46, 16), (44, 30), (36, 40), (24, 36), (18, 28)], steel)
+        shine((30, 9), (40, 9))
+        shine((43, 17), (43, 28))
+        pygame.draw.line(big, steel_d, (44, 30), (36, 39), 3)
+    elif key == "pick":
+        handle((8, 44), (30, 18), 5)
+        solid([(3, 24), (12, 12), (24, 8), (38, 8), (46, 16), (42, 20), (36, 14), (26, 14), (18, 18), (10, 28)],
+              steel)
+        shine((14, 13), (24, 9))
+        pygame.draw.line(big, steel_d, (30, 14), (40, 18), 2)
+    elif key == "can":
+        blue, blue_l, blue_d = (84, 140, 204), (138, 190, 240), (56, 98, 160)
+        arch = [(12, 20), (14, 9), (24, 4), (32, 9), (34, 20)]
+        pygame.draw.lines(big, ink, False, arch, 8)
+        pygame.draw.lines(big, blue_d, False, arch, 5)
+        pygame.draw.rect(big, ink, (8, 18, 28, 24), border_radius=7)
+        pygame.draw.rect(big, blue, (10, 20, 24, 20), border_radius=6)
+        pygame.draw.rect(big, blue_l, (12, 22, 6, 14), border_radius=3)
+        pygame.draw.rect(big, blue_d, (10, 32, 24, 4))
+        solid([(30, 28), (42, 12), (48, 16), (38, 34)], blue)
+        pygame.draw.polygon(big, blue_l, [(42, 12), (48, 16), (46, 18), (41, 15)])
+        pygame.draw.rect(big, ink, (41, 4, 8, 9), border_radius=2)
+        for hx, hy in ((43, 6), (46, 8), (43, 10)):
+            big.set_at((hx, hy), ink)
+    elif key == "rod":
+        pygame.draw.line(big, ink, (6, 44), (40, 8), 6)
+        pygame.draw.line(big, wood, (6, 44), (40, 8), 3)
+        pygame.draw.line(big, wood_l, (7, 42), (40, 9), 1)
+        for t in (0.22, 0.3, 0.38):
+            gx, gy = 6 + 34 * t, 44 - 36 * t
+            pygame.draw.line(big, (190, 52, 46), (gx - 3, gy - 3), (gx + 3, gy + 3), 3)
+        pygame.draw.circle(big, ink, (18, 34), 8)
+        pygame.draw.circle(big, steel, (18, 34), 5)
+        pygame.draw.line(big, steel_d, (18, 30), (18, 38), 2)
+        pygame.draw.line(big, steel_d, (14, 34), (22, 34), 2)
+        pygame.draw.line(big, (230, 230, 236), (40, 8), (44, 36), 1)
+        pygame.draw.circle(big, ink, (44, 37), 5)
+        pygame.draw.circle(big, (220, 60, 50), (44, 37), 4)
+        pygame.draw.circle(big, (250, 250, 250), (44, 34), 2)
+        pygame.draw.lines(big, steel_d, False, [(44, 42), (44, 45), (41, 46)], 2)
+    return pygame.transform.smoothscale(big, (16, 16))
+
+
 def make_icon(key):
+    if key in TOOL_ICON_KEYS:
+        return make_tool_icon(key)
     s = surf(16, 16)
     wood = (150, 104, 62)
     steel = (176, 184, 196)
@@ -247,13 +934,55 @@ def make_icon(key):
         C(GOLD, 8, 8, 6)
         C((252, 226, 120), 6, 6, 2)
         R((200, 140, 30), 7, 5, 2, 6)
+    elif key in CROPS:
+        C(CROPS[key]["fruit"], 8, 9, 6)
+        C((255, 255, 255), 6, 7, 1)
+        L(green, (8, 3), (8, 1))
+    elif key == "villager_house_kit":
+        P((230, 200, 150), [(8, 1), (15, 7), (1, 7)])
+        R((230, 200, 150), 3, 7, 10, 8)
+        R((190, 82, 62), 2, 5, 12, 2)
+        R((120, 80, 50), 7, 10, 3, 5)
+    elif key == "rod":
+        L(wood, (2, 14), (12, 3), 2)
+        L((220, 220, 226), (12, 3), (14, 4))
+        L((230, 230, 236), (14, 4), (14, 11))
+        C((220, 60, 50), 14, 12, 2)
+    elif key in FISH:
+        draw_fish_icon(s, key, FISH[key]["color"], FISH[key]["tier"])
+    elif key == "flour":
+        P((236, 226, 200), [(3, 6), (13, 6), (14, 14), (2, 14)])
+        R((200, 186, 150), 5, 3, 6, 3)
+        R((150, 120, 80), 6, 9, 4, 2)
+    elif key == "milk":
+        R((250, 250, 252), 4, 5, 8, 10)
+        P((250, 250, 252), [(4, 5), (8, 1), (12, 5)])
+        R((90, 150, 220), 4, 8, 8, 3)
+        pygame.draw.rect(s, (110, 120, 140), (4, 5, 8, 10), 1)
+    elif key == "sugar":
+        R((250, 240, 245), 3, 6, 10, 8)
+        R((240, 150, 180), 3, 6, 10, 2)
+        for p in ((5, 9), (8, 11), (11, 9)):
+            s.set_at(p, (200, 200, 210))
+    elif key == "ticket":
+        R((246, 150, 60), 1, 4, 14, 8)
+        C((200, 100, 30), 1, 8, 2)
+        C((200, 100, 30), 14, 8, 2)
+        R((255, 220, 120), 4, 6, 8, 1)
+        R((255, 220, 120), 4, 9, 8, 1)
+    elif key == "energy_bar":
+        R((90, 170, 90), 2, 5, 12, 7)
+        R((250, 240, 200), 4, 6, 8, 5)
+        R((220, 80, 60), 6, 7, 4, 3)
+        L((60, 120, 60), (2, 5), (13, 5))
     elif ITEMS.get(key, {}).get("kind") == "food":
         plate = (238, 232, 222)
         plate_d = (190, 182, 170)
-        if key in ("stew", "soup", "tea"):
+        if key in ("stew", "soup", "tea", "latte", "pumpkin_latte", "fish_stew"):
             E((120, 84, 60), 2, 6, 12, 9)
             E((160, 112, 80), 2, 5, 12, 8)
-            col = {"stew": (206, 120, 56), "soup": (214, 64, 48), "tea": (176, 120, 70)}[key]
+            col = {"stew": (206, 120, 56), "soup": (214, 64, 48), "tea": (176, 120, 70),
+                   "latte": (236, 212, 176), "pumpkin_latte": (232, 144, 64), "fish_stew": (206, 110, 76)}[key]
             E(col, 3, 5, 10, 5)
             if key == "stew":
                 for p in ((5, 7), (8, 6), (10, 8)):
@@ -268,17 +997,64 @@ def make_icon(key):
                 C((248, 190, 40), 8, 9, 2)
             elif key == "bread":
                 E((206, 146, 76), 3, 3, 10, 9)
-                E((232, 178, 100), 3, 3, 10, 5)
-                for x in (5, 8, 11):
+                E((232, 178, 100), 3, 3, 10, 5)                for x in (5, 8, 11):
                     L((170, 112, 56), (x, 4), (x + 1, 7))
             elif key == "pie":
                 E((214, 160, 90), 2, 5, 12, 9)
                 E((232, 128, 40), 4, 6, 8, 5)
                 L((214, 160, 90), (4, 8), (12, 8))
                 L((214, 160, 90), (8, 6), (8, 11))
+            elif key == "pancakes":
+                for yy, cc in ((8, (214, 160, 80)), (6, (232, 184, 100)), (4, (214, 160, 80))):
+                    E(cc, 3, yy, 10, 4)
+                R((255, 232, 120), 6, 3, 4, 2)
+            elif key == "cake":
+                P((250, 200, 210), [(2, 12), (14, 12), (12, 5), (4, 5)])
+                R((255, 250, 240), 3, 8, 10, 2)
+                C((220, 50, 70), 8, 4, 2)
+            elif key == "grilled_fish":
+                E((176, 120, 70), 2, 6, 11, 6)
+                P((176, 120, 70), [(12, 9), (15, 6), (15, 12)])
+                for xx in (5, 7, 9):
+                    L((90, 60, 40), (xx, 6), (xx, 11))
     else:
         R((200, 60, 60), 4, 4, 8, 8)
     return s
+
+
+EXTRA_SHAPES = ("leaf", "bush", "stalk", "bulb", "pod", "spike")
+
+
+def draw_shape_extra(s, shape, fr, g1, g2):
+    """Fully grown looks for the extra crop shapes (16x16 pixels)."""
+    if shape == "leaf":                       # leafy head
+        for x, y, r in ((5, 9, 4), (11, 9, 4), (8, 6, 4), (8, 11, 4)):
+            pygame.draw.circle(s, g1, (x, y), r)
+        pygame.draw.circle(s, lerp_col(g1, (255, 255, 255), 0.3), (8, 8), 2)
+    elif shape == "bush":                     # berry bush
+        pygame.draw.circle(s, g2, (8, 9), 6)
+        pygame.draw.circle(s, g1, (7, 7), 5)
+        for x, y in ((4, 9), (9, 6), (11, 10), (6, 12)):
+            pygame.draw.circle(s, fr, (x, y), 1)
+    elif shape == "stalk":                    # tall stalk with a bloom on top
+        pygame.draw.line(s, g2, (8, 15), (8, 3), 2)
+        for y in (6, 9, 12):
+            pygame.draw.line(s, g1, (8, y), (5, y - 2), 1)
+            pygame.draw.line(s, g1, (8, y), (11, y - 2), 1)
+        pygame.draw.circle(s, fr, (8, 3), 3)
+    elif shape == "bulb":                     # bulb with leaf tops
+        pygame.draw.ellipse(s, fr, (4, 7, 9, 8))
+        pygame.draw.line(s, g1, (8, 7), (5, 1), 1)
+        pygame.draw.line(s, g1, (8, 7), (11, 1), 1)
+        pygame.draw.line(s, g2, (8, 7), (8, 0), 1)
+    elif shape == "pod":                      # hanging pods
+        pygame.draw.ellipse(s, g1, (2, 4, 12, 9))
+        for x, y in ((5, 8), (8, 9), (11, 7)):
+            pygame.draw.line(s, g2, (x, y), (x, y + 6), 2)
+            pygame.draw.circle(s, fr, (x, y + 7), 2)
+    else:                                     # spike: a pointed tip
+        pygame.draw.polygon(s, g1, [(8, 0), (14, 8), (8, 15), (2, 8)])
+        pygame.draw.polygon(s, fr, [(8, 3), (11, 8), (8, 12), (5, 8)])
 
 
 def make_crop_sprite(ck, stage):
@@ -329,6 +1105,8 @@ def make_crop_sprite(ck, stage):
             for p in ((4, 8), (8, 6), (11, 9), (6, 11), (10, 12)):
                 pygame.draw.circle(s, fr, p, 2)
                 s.set_at((p[0] - 1, p[1] - 1), (255, 255, 255))
+        elif shape in EXTRA_SHAPES:
+            draw_shape_extra(s, shape, fr, g1, g2)
         else:
             for a in ((2, 8), (14, 8), (3, 4), (13, 4)):
                 L(g2, (8, 8), a, 2)
@@ -441,6 +1219,64 @@ def make_glow(r):
     return s
 
 
+VILLAGE_STYLES = {
+    "village_house": dict(wall=(236, 222, 186), trim=(168, 134, 96), roof=(64, 128, 118),
+                          roof_d=(42, 92, 86), door=(40, 90, 84), chimney=(150, 84, 72)),
+    "village_house2": dict(wall=(176, 186, 202), trim=(84, 88, 104), roof=(108, 82, 142),
+                           roof_d=(78, 56, 106), door=(124, 62, 52), chimney=(120, 110, 120)),
+    "village_house3": dict(wall=(238, 206, 150), trim=(248, 242, 230), roof=(150, 86, 54),
+                           roof_d=(110, 60, 36), door=(72, 122, 74), chimney=(120, 70, 60)),
+    "player_house": dict(wall=(230, 200, 150), trim=(150, 112, 74), roof=(190, 82, 62),
+                         roof_d=(140, 56, 42), door=(60, 100, 160), chimney=(110, 96, 90)),
+}
+
+
+def make_village_house(style):
+    """A 6x5 tile house: gable roof with shingles, boarded walls, two windows, a door and a chimney."""
+    p = VILLAGE_STYLES[style]
+    s = surf(96, 80)
+    wall, trim, roof, roof_d = p["wall"], p["trim"], p["roof"], p["roof_d"]
+    wall_d = lerp_col(wall, (60, 44, 36), 0.25)
+    s.fill(wall, (6, 36, 84, 40))
+    for x in range(6, 90, 7):                        # vertical boards
+        s.fill(wall_d, (x, 36, 1, 40))
+    if style == "village_house2":                    # half-timbering
+        for x in (6, 44, 88):
+            s.fill(trim, (x, 36, 3, 40))
+        s.fill(trim, (6, 56, 84, 3))
+    s.fill((150, 150, 156), (4, 74, 88, 6))          # stone foundation
+    for x in range(4, 92, 8):
+        s.fill((118, 118, 124), (x, 74, 1, 6))
+    s.fill(p["chimney"], (66, 4, 9, 22))
+    s.fill(lerp_col(p["chimney"], (0, 0, 0), 0.3), (66, 4, 9, 2))
+    roof_poly = [(0, 38), (96, 38), (48, 0)]         # gable roof with shingle rows
+    pygame.draw.polygon(s, roof, roof_poly)
+    for y in range(4, 38, 5):
+        half = int(48 * y / 38)
+        pygame.draw.line(s, roof_d, (48 - half, y), (48 + half, y), 1)
+        offset = 0 if (y // 5) % 2 == 0 else 4
+        for x in range(48 - half + offset, 48 + half, 8):
+            s.fill(roof_d, (x, y, 1, 4))
+    pygame.draw.polygon(s, roof_d, roof_poly, 2)
+    for wx in (14, 68):                              # windows: frame, cross bars, sill
+        s.fill(trim, (wx - 2, 44, 18, 18))
+        s.fill((178, 218, 236), (wx, 46, 14, 14))
+        s.fill(trim, (wx + 6, 46, 2, 14))
+        s.fill(trim, (wx, 52, 14, 2))
+        s.fill(trim, (wx - 3, 62, 20, 3))
+    if style in ("village_house3", "player_house"):  # flower boxes under the windows
+        for wx in (14, 68):
+            s.fill((120, 74, 50), (wx - 2, 65, 18, 4))
+            for i, c in enumerate(((236, 110, 140), (250, 220, 100), (200, 140, 240))):
+                s.fill(c, (wx + i * 5, 63, 3, 2))
+    s.fill(trim, (40, 52, 16, 22))                   # door: frame, panel line, handle
+    s.fill(p["door"], (42, 54, 12, 20))
+    s.fill(lerp_col(p["door"], (0, 0, 0), 0.25), (47, 54, 2, 20))
+    s.set_at((51, 66), (240, 200, 80))
+    s.fill((150, 150, 156), (38, 74, 20, 2))
+    return s
+
+
 def build_static_sprites():
     # --- house
     h = surf(96, 80)
@@ -480,6 +1316,9 @@ def build_static_sprites():
             h.fill(c, (wx + 2 + i * 6, 61, 3, 2))
     SPR["house"] = h
     SPR["house_windows"] = [(18, 48, 14, 12), (64, 48, 14, 12)]
+    SPR["village_windows"] = [(14, 46, 14, 14), (68, 46, 14, 14)]
+    for style in VILLAGE_STYLES:
+        SPR[style] = make_village_house(style)
     # --- kitchen
     k = surf(64, 48)
     k.fill((236, 222, 190), (4, 20, 56, 26))
@@ -580,8 +1419,8 @@ def build_static_sprites():
     pygame.draw.ellipse(sh, (0, 0, 0, 70), (0, 0, 14, 6))
     SPR["shadow"] = sh
     SPR["egg"] = pygame.transform.scale(make_icon("egg"), (8, 8))
-    SPR["soil_dry"] = make_soil(False)
-    SPR["soil_wet"] = make_soil(True)
+    SPR["soil_dry"] = tex("soil_dry") or make_soil(False)
+    SPR["soil_wet"] = tex("soil_wet") or make_soil(True)
     SPR["crops"] = {(ck, st): make_crop_sprite(ck, st) for ck in CROPS for st in range(5)}
     SPR["glow_s"] = make_glow(14)
     SPR["glow_m"] = make_glow(30)
@@ -638,40 +1477,80 @@ def build_season_sprites(season):
     pal = PAL[season]
     rnd = random.Random(7)
     SPR["grass"] = []
+    # Fixed tuft positions per variant: calm, repeatable grass instead of random speckle.
+    tufts = [[(3, 6), (9, 3), (13, 11)], [(6, 13), (11, 8), (2, 2)], [(4, 9), (14, 5), (8, 14)],
+             [(10, 12), (1, 4), (12, 1)], [(7, 3), (3, 12), (14, 14)], [(12, 7), (5, 8), (9, 10)],
+             [(2, 14), (8, 1), (13, 9)], [(6, 6), (10, 13), (15, 2)]]
     for v in range(8):
         t = pygame.Surface((16, 16))
         t.fill(pal["grass"])
-        for _ in range(16):
-            t.set_at((rnd.randrange(16), rnd.randrange(16)),
-                     pal["grass_d"] if rnd.random() < 0.55 else pal["grass_l"])
-        if v >= 4:
-            x, y = rnd.randrange(3, 12), rnd.randrange(5, 13)
-            for dx, dy in ((0, 0), (0, -1), (1, 0), (1, -1), (1, -2), (2, 0), (2, -1)):
-                t.set_at((x + dx, y + dy), pal["grass_l"] if dx == 1 else pal["grass_d"])
+        # soft two-tone mottling on a 4x4 grid: reads as ground, not noise
+        for gy in range(0, 16, 4):
+            for gx in range(0, 16, 4):
+                if (gx // 4 + gy // 4 + v) % 3 == 0:
+                    t.fill(pal["grass_l"], (gx + 1, gy + 1, 2, 2))
+        for x, y in tufts[v]:
+            t.set_at((x, y), pal["grass_d"])
+            t.set_at((x - 1, y + 1), pal["grass_d"])
+            t.set_at((x + 1, y + 1), pal["grass_d"])
+            t.set_at((x, y + 1), pal["grass_l"])
+        if v >= 6:
+            fx, fy = tufts[v][0]
+            t.set_at((fx, max(0, fy - 2)), pal["flower"][v % len(pal["flower"])])
         SPR["grass"].append(t)
+    if tex("grass"):
+        SPR["grass"] = [tex("grass")] * 8
+    # Dirt path: hand-laid cobbles with a darker grout line
     SPR["path"] = []
+    for v in range(4):
+        t = pygame.Surface((16, 16))
+        t.fill((150, 116, 76))
+        tones = [(198, 162, 110), (190, 154, 104), (204, 168, 116), (194, 158, 106)]
+        off = (v * 3) % 8
+        for cy in (0, 8):
+            for cx in (-8, 0, 8):
+                x0, y0 = cx + off, cy
+                tone = tones[(cx // 8 + cy // 8 + v) % len(tones)]
+                t.fill(tone, (max(0, x0 + 1), y0 + 1, 6, 6))
+        t.set_at(((v * 5) % 14 + 1, (v * 7) % 14 + 1), (226, 196, 146))
+        SPR["path"].append(t)
+    # Sand: fine ripples on the sandbanks
     SPR["sand"] = []
-    for base, lst in (((200, 170, 116), SPR["path"]), ((226, 206, 152), SPR["sand"])):
-        for v in range(4):
-            t = pygame.Surface((16, 16))
-            t.fill(base)
-            for _ in range(18):
-                c = lerp_col(base, (150, 120, 80), 0.3) if rnd.random() < 0.5 else lerp_col(base, (255, 240, 200), 0.3)
-                t.set_at((rnd.randrange(16), rnd.randrange(16)), c)
-            for _ in range(3):
-                x, y = rnd.randrange(1, 14), rnd.randrange(2, 14)
-                t.fill(lerp_col(base, (110, 90, 60), 0.4), (x, y, 2, 1))
-                t.fill(lerp_col(base, (255, 245, 210), 0.5), (x, y - 1, 2, 1))
-            lst.append(t)
+    for v in range(4):
+        t = pygame.Surface((16, 16))
+        t.fill((228, 210, 158))
+        for y in (3, 8, 13):
+            for x in range(((v * 2) + y) % 4, 15, 4):
+                t.set_at((x, y), (240, 226, 180))
+                t.set_at((x + 1, y + 1), (210, 190, 138))
+        SPR["sand"].append(t)
+    # Water: deep blue with moving light bands (4 frames)
     SPR["water"] = []
     for f in range(4):
         t = pygame.Surface((16, 16))
-        t.fill((64, 138, 196))
-        for i in range(3):
-            y = (i * 6 + f * 2) % 16
-            t.fill((112, 184, 230), (2 + (i * 5 + f * 3) % 9, y, 5, 1))
-            t.fill((88, 160, 214), ((i * 7 + f * 2) % 11, (y + 3) % 16, 3, 1))
+        t.fill((58, 128, 186))
+        for band in range(3):
+            y = (band * 6 + f * 2) % 16
+            x0 = (band * 5 + f * 3) % 11
+            t.fill((96, 168, 220), (x0, y, 5, 1))
+            t.fill((78, 150, 204), ((x0 + 6) % 11, (y + 1) % 16, 2, 1))
         SPR["water"].append(t)
+    # Bridge deck: planks with railings on the top and bottom rows
+    SPR["bridge"] = []
+    for row in ("top", "mid", "bottom"):
+        t = pygame.Surface((16, 16))
+        t.fill((150, 104, 64))
+        for x in range(0, 16, 4):
+            t.fill((112, 76, 46), (x, 0, 1, 16))
+        if row == "top":
+            t.fill((118, 80, 48), (0, 0, 16, 4))
+            for x in (0, 8):
+                t.fill((86, 56, 34), (x, 0, 2, 6))
+        elif row == "bottom":
+            t.fill((118, 80, 48), (0, 12, 16, 4))
+            for x in (0, 8):
+                t.fill((86, 56, 34), (x, 10, 2, 6))
+        SPR["bridge"].append(t)
     # canopies
     d, m, l = pal["leaf_d"], pal["leaf"], pal["leaf_l"]
     SPR["canopy"] = []
@@ -728,6 +1607,243 @@ def fence_sprite(l, r, u, d):
     return s
 
 
+def load_crazy_dew_art():
+    """Cuts Crazy Dew's drawing out of crazy_dew.png. Returns (sprite 16x24, portrait 96x104), or None
+    when the picture is not next to the game. The white paper around the drawing becomes transparent."""
+    path = None
+    for folder in (APP_DIR, os.path.dirname(os.path.abspath(__file__))):
+        if os.path.isfile(os.path.join(folder, "crazy_dew.png")):
+            path = os.path.join(folder, "crazy_dew.png")
+            break
+    if path is None:
+        return None
+    try:
+        img = pygame.image.load(path)
+    except pygame.error:
+        return None
+    W, H = img.get_size()
+    x, y, w, h = CRAZY_ART_RECT
+    x, y = min(x, W - 1), min(y, H - 1)
+    w, h = min(w, W - x), min(h, H - y)
+    crop = img.subsurface(pygame.Rect(x, y, w, h)).copy().convert_alpha()
+    cw, ch = crop.get_size()
+    seen = bytearray(cw * ch)
+    stack = [(i, 0) for i in range(cw)] + [(i, ch - 1) for i in range(cw)] + \
+            [(0, j) for j in range(ch)] + [(cw - 1, j) for j in range(ch)]
+    while stack:                                  # flood fill the outside paper from the edges inward
+        px, py = stack.pop()
+        if not (0 <= px < cw and 0 <= py < ch) or seen[py * cw + px]:
+            continue
+        seen[py * cw + px] = 1
+        r, g, b, _a = crop.get_at((px, py))
+        if r > 225 and g > 225 and b > 225:
+            crop.set_at((px, py), (255, 255, 255, 0))
+            stack += [(px + 1, py), (px - 1, py), (px, py + 1), (px, py - 1)]
+    sprite = pygame.transform.smoothscale(crop, (16, 24))
+    portrait = pygame.transform.smoothscale(crop, (96, 104))
+    return sprite, portrait
+
+
+def build_extra_sprites():
+    font = pygame.font.Font(None, 20)
+    small = pygame.font.Font(None, 15)
+    # --- cafe (8x4 tiles)
+    c = surf(128, 64)
+    c.fill((236, 214, 170), (4, 22, 120, 42))
+    for x in range(4, 124, 8):
+        c.fill((214, 190, 146), (x, 22, 1, 42))
+    pygame.draw.rect(c, (140, 104, 70), (4, 22, 120, 42), 1)
+    rp = [(0, 28), (128, 28), (116, 4), (12, 4)]
+    pygame.draw.polygon(c, (150, 80, 70), rp)
+    for y in range(9, 28, 5):
+        c.fill((124, 62, 56), (12 - int((y - 4) * 0.5), y, 104 + int((y - 4)), 1))
+    pygame.draw.polygon(c, (96, 46, 40), rp, 2)
+    c.fill((92, 58, 34), (40, 8, 48, 14))
+    pygame.draw.rect(c, (60, 38, 24), (40, 8, 48, 14), 1)
+    t = font.render("CAFE", True, (255, 232, 170))
+    c.blit(t, (64 - t.get_width() // 2, 10))
+    for wx in (12, 92):
+        c.fill((250, 214, 130), (wx, 36, 24, 18))
+        pygame.draw.rect(c, (240, 236, 226), (wx - 1, 35, 26, 20), 2)
+        c.fill((240, 236, 226), (wx + 11, 36, 2, 18))
+        c.fill((120, 84, 56), (wx - 2, 55, 28, 3))
+    c.fill((112, 72, 44), (56, 38, 16, 26))
+    pygame.draw.rect(c, (80, 50, 30), (56, 38, 16, 26), 1)
+    c.fill((240, 200, 80), (68, 52, 2, 2))
+    for i in range(16):
+        col = (214, 70, 64) if i % 2 == 0 else (248, 240, 228)
+        c.fill(col, (i * 8, 26, 8, 8))
+        pygame.draw.circle(c, col, (i * 8 + 4, 34), 4)
+    SPR["cafe"] = c
+    # --- table with chairs
+    tb = surf(16, 16)
+    tb.fill((140, 100, 66), (0, 6, 3, 8))
+    tb.fill((140, 100, 66), (13, 6, 3, 8))
+    tb.fill((110, 76, 48), (7, 12, 2, 4))
+    pygame.draw.ellipse(tb, (200, 70, 64), (1, 5, 14, 8))
+    pygame.draw.ellipse(tb, (248, 240, 228), (2, 5, 12, 6))
+    for p in ((5, 7), (8, 6), (10, 8), (7, 9)):
+        tb.fill((214, 70, 64), (p[0], p[1], 2, 2))
+    SPR["table"] = tb
+    # --- PC desk (2x1 tiles, monitor rises above)
+    pc = surf(32, 32)
+    pc.fill((150, 108, 70), (0, 20, 32, 5))
+    pc.fill((196, 150, 100), (0, 20, 32, 2))
+    pc.fill((120, 84, 54), (1, 25, 4, 7))
+    pc.fill((120, 84, 54), (27, 25, 4, 7))
+    pc.fill((50, 52, 64), (7, 2, 18, 14))
+    pc.fill((96, 176, 236), (9, 4, 14, 10))
+    pc.fill((255, 255, 255), (11, 6, 6, 1))
+    pc.fill((255, 255, 255), (11, 8, 9, 1))
+    pc.fill((250, 200, 60), (11, 10, 4, 2))
+    pc.fill((50, 52, 64), (14, 16, 4, 3))
+    pc.fill((222, 222, 230), (9, 21, 12, 3))
+    pc.fill((240, 240, 246), (23, 21, 3, 3))
+    SPR["pc"] = pc
+    # --- arcade cabinet (2x1 tiles, 40px tall)
+    ar = surf(32, 40)
+    ar.fill((70, 50, 120), (2, 6, 28, 34))
+    ar.fill((52, 36, 96), (2, 6, 3, 34))
+    pygame.draw.rect(ar, (30, 20, 60), (2, 6, 28, 34), 1)
+    ar.fill((240, 70, 140), (3, 0, 26, 8))
+    tt = small.render("PLAY", True, (255, 240, 160))
+    ar.blit(tt, (16 - tt.get_width() // 2, 1))
+    ar.fill((20, 20, 36), (6, 11, 20, 14))
+    pygame.draw.rect(ar, (140, 140, 170), (6, 11, 20, 14), 1)
+    for p in ((9, 14), (14, 20), (20, 16), (22, 21)):
+        ar.fill((90, 220, 250), (p[0], p[1], 2, 2))
+    ar.fill((40, 30, 80), (4, 27, 24, 6))
+    ar.fill((230, 60, 60), (9, 24, 3, 4))
+    ar.fill((120, 120, 140), (10, 27, 1, 2))
+    ar.fill((250, 220, 80), (17, 28, 3, 3))
+    ar.fill((90, 200, 250), (22, 28, 3, 3))
+    ar.fill((250, 200, 60), (14, 35, 4, 2))
+    SPR["arcade"] = ar
+    # --- cafe interior
+    fl = surf(16, 16)
+    fl.fill((176, 128, 84))
+    for y in (0, 5, 10, 15):
+        fl.fill((150, 106, 68), (0, y, 16, 1))
+    for x in (3, 11):
+        fl.fill((150, 106, 68), (x, 0, 1, 5))
+        fl.fill((150, 106, 68), (x + 4, 5, 1, 5))
+    SPR["wood_floor"] = fl
+    wl = surf(16, 16)
+    wl.fill((96, 70, 56))
+    wl.fill((70, 50, 40), (0, 0, 16, 2))
+    wl.fill((120, 90, 68), (2, 6, 12, 2))
+    wl.fill((120, 90, 68), (2, 12, 12, 2))
+    SPR["wall"] = wl
+    st = surf(48, 20)
+    st.fill((48, 48, 56), (0, 0, 48, 4))
+    st.fill((80, 80, 88), (0, 4, 48, 16))
+    for bx in (8, 24, 40):
+        pygame.draw.circle(st, (40, 40, 44), (bx, 6), 4)
+        pygame.draw.circle(st, (240, 110, 40), (bx, 6), 2)
+    st.fill((60, 60, 66), (2, 12, 44, 3))
+    SPR["fur_stove"] = st
+    rg = surf(48, 20)
+    rg.fill((160, 116, 76), (0, 6, 48, 14))
+    rg.fill((120, 84, 54), (0, 6, 48, 2))
+    rg.fill((70, 180, 170), (14, 0, 20, 8))
+    rg.fill((40, 120, 112), (16, 2, 16, 2))
+    rg.fill((250, 226, 140), (20, 4, 8, 2))
+    SPR["fur_register"] = rg
+    dr = surf(16, 20)
+    dr.fill((120, 80, 50), (1, 2, 14, 18))
+    dr.fill((90, 56, 34), (2, 3, 12, 6))
+    dr.fill((90, 56, 34), (2, 11, 12, 8))
+    dr.fill((240, 200, 80), (12, 11, 2, 2))
+    dr.fill((255, 240, 180), (5, 0, 6, 2))
+    SPR["fur_exitdoor"] = dr
+    bd = surf(32, 20)
+    bd.fill((150, 110, 80), (0, 4, 32, 16))
+    bd.fill((200, 170, 120), (2, 6, 28, 10))
+    bd.fill((236, 232, 220), (3, 6, 10, 9))
+    bd.fill((236, 110, 140), (4, 8, 6, 3))
+    bd.fill((210, 96, 60), (17, 6, 12, 9))
+    bd.fill((248, 226, 150), (19, 8, 8, 2))
+    SPR["fur_bed"] = bd
+    cp = surf(32, 20)
+    cp.fill((60, 56, 72), (4, 0, 24, 14))
+    cp.fill((110, 200, 240), (6, 2, 20, 10))
+    cp.fill((255, 255, 255), (8, 4, 8, 1))
+    cp.fill((250, 210, 80), (8, 7, 4, 2))
+    cp.fill((90, 80, 100), (14, 14, 4, 3))
+    cp.fill((230, 230, 236), (6, 17, 20, 3))
+    SPR["fur_computer"] = cp
+    wb = surf(32, 20)
+    wb.fill((140, 98, 62), (0, 6, 32, 14))
+    wb.fill((190, 146, 96), (0, 6, 32, 3))
+    wb.fill((110, 74, 46), (2, 10, 28, 1))
+    for hx in (5, 15, 25):
+        wb.fill((170, 170, 180), (hx, 3, 4, 3))
+    wb.fill((96, 64, 40), (4, 16, 3, 4))
+    wb.fill((96, 64, 40), (25, 16, 3, 4))
+    SPR["fur_bench"] = wb
+    dk = surf(32, 20)
+    dk.fill((150, 110, 74), (0, 6, 32, 14))
+    for x in range(0, 32, 6):
+        dk.fill((120, 86, 56), (x, 6, 1, 14))
+    dk.fill((90, 64, 40), (0, 4, 32, 2))
+    dk.fill((70, 110, 170), (0, 16, 32, 4))
+    SPR["fur_dock"] = dk
+    SPR["fur_dock_back"] = dk
+    SPR["fur_port"] = dk
+    vp = surf(32, 20)                                  # ferry pier on the river bank
+    vp.fill((70, 110, 170), (0, 12, 32, 8))            # river under the pier
+    vp.fill((150, 110, 74), (0, 3, 32, 9))             # planks
+    for x in range(0, 32, 6):
+        vp.fill((120, 86, 56), (x, 3, 1, 9))
+    vp.fill((90, 64, 40), (0, 1, 32, 2))               # top rail
+    for x in (2, 27):
+        vp.fill((80, 56, 36), (x, 10, 2, 9))           # posts standing in the water
+    vp.fill((200, 60, 50), (8, 9, 12, 3))              # moored rowboat
+    vp.fill((240, 240, 240), (11, 9, 4, 3))
+    vp.fill((250, 200, 60), (22, 0, 3, 3))             # lantern
+    SPR["fur_village_port"] = vp
+    rn = surf(48, 36)                                  # a broken stone ruin
+    rn.fill((132, 130, 128), (0, 12, 48, 24))
+    for x in range(0, 48, 12):
+        rn.fill((100, 98, 96), (x, 12, 1, 24))
+    rn.fill((100, 98, 96), (0, 12, 48, 2))
+    rn.fill((0, 0, 0, 0), (14, 0, 12, 12))            # broken top
+    rn.fill((116, 114, 112), (0, 6, 14, 6))
+    rn.fill((116, 114, 112), (34, 4, 14, 8))
+    rn.fill((80, 120, 70), (4, 28, 10, 3))            # moss
+    SPR["fur_ruin"] = rn
+    SPR["remote"] = make_char((236, 196, 168), (60, 40, 30), (110, 150, 210), (80, 70, 100), hat=(120, 200, 120))
+    SPR["fishmaster"] = make_char((214, 170, 130), (236, 236, 240), (40, 110, 140), (60, 60, 80), hat=(40, 110, 140))
+    SPR["fisherman"] = make_char((212, 168, 128), (90, 60, 40), (70, 110, 90), (60, 60, 70), hat=(190, 150, 80))
+    SPR["gus"] = make_char((236, 196, 160), (206, 206, 210), (246, 246, 238), (80, 80, 92), apron=True,
+                           hat=(250, 250, 250))
+    SPR["lila"] = make_char((200, 150, 110), (60, 30, 20), (120, 170, 80), (90, 70, 50), hat=(200, 160, 90))
+    SPR["pip"] = make_char((246, 212, 184), (230, 180, 60), (240, 120, 120), (70, 90, 140), bun=True)
+    SPR["tomas"] = make_char((222, 176, 136), (50, 36, 30), (160, 110, 70), (60, 64, 80), hat=(236, 196, 60))
+    SPR["dario"] = make_char((170, 120, 90), (20, 20, 20), (210, 60, 50), (50, 60, 90), hat=(40, 40, 44))
+    SPR["oldsalt"] = make_char((200, 160, 120), (200, 200, 210), (60, 90, 130), (70, 60, 60), hat=(60, 90, 130))
+    SPR["coral"] = make_char((240, 200, 170), (200, 60, 90), (250, 200, 120), (90, 120, 160), skirt=True)
+    art = load_crazy_dew_art()
+    if art is not None:
+        sprite, portrait = art
+        SPR["crazy_dew"] = {(d, f): sprite for d in ("down", "up", "left", "right") for f in range(4)}
+        PORTRAITS["Crazy Dew"] = portrait
+    else:                                         # no picture: a plain stand-in
+        SPR["crazy_dew"] = make_char((236, 236, 236), (40, 40, 40), (150, 216, 230), (80, 80, 110))
+    # --- customers
+    variants = [
+        ((244, 205, 170), (60, 40, 30), (214, 90, 90), (80, 80, 110), {}),
+        ((226, 180, 140), (30, 24, 24), (90, 160, 110), (70, 70, 90), {}),
+        ((250, 216, 190), (190, 120, 60), (230, 190, 80), (100, 80, 70), {}),
+        ((180, 130, 100), (40, 30, 26), (120, 100, 200), (60, 60, 80), {}),
+        ((240, 200, 170), (230, 230, 236), (180, 90, 150), (90, 70, 60), dict(skirt=True, bun=True)),
+        ((236, 190, 160), (120, 70, 40), (240, 130, 70), (70, 90, 120), dict(skirt=True)),
+        ((210, 160, 120), (20, 20, 24), (70, 140, 200), (90, 90, 90), dict(hat=(190, 190, 200))),
+        ((246, 210, 180), (250, 210, 100), (200, 70, 70), (60, 60, 70), {}),
+    ]
+    SPR["customers"] = [make_char(a, b, cc, d, **kw) for a, b, cc, d, kw in variants]
+
+
 # ============================================================ entities
 class Player:
     def __init__(self, x, y):
@@ -761,25 +1877,1890 @@ class NPC:
         self.tx, self.ty = x, y
 
 
+# ============================================================ cafe, PC, arcade, fishing
+class Customer:
+    def __init__(self, table, order, sprites):
+        self.table, self.order, self.sprites = table, order, sprites
+        self.x = 63 * TILE + 8
+        self.y = 20 * TILE + 12
+        self.dir = "left"
+        self.state = "arrive"
+        self.anim = 0.0
+        self.max_patience = 85.0
+        self.patience = self.max_patience
+        self.eat_t = 0.0
+
+
+def draw_star(surface, cx, cy, r, color):
+    pts = []
+    for i in range(10):
+        a = -math.pi / 2 + i * math.pi / 5
+        rr = r if i % 2 == 0 else r * 0.45
+        pts.append((cx + math.cos(a) * rr, cy + math.sin(a) * rr))
+    pygame.draw.polygon(surface, color, pts)
+
+
+def draw_heart(surface, cx, cy, r, color):
+    pygame.draw.circle(surface, color, (cx - r // 2, cy - r // 3), r // 2 + 1)
+    pygame.draw.circle(surface, color, (cx + r // 2, cy - r // 3), r // 2 + 1)
+    pygame.draw.polygon(surface, color, [(cx - r, cy - r // 6), (cx + r, cy - r // 6), (cx, cy + r)])
+
+
+QUIZ = [
+    ("Where were potatoes first domesticated?", ["The Andes (South America)", "Mexico", "China", "Ireland"], 0),
+    ("Where was the tomato first domesticated?", ["Italy", "Mexico", "Egypt", "India"], 1),
+    ("Which people are credited with brewing beer over 5,000 years ago?", ["The Romans", "The Sumerians", "The Vikings", "The Inca"], 1),
+    ("Which ancient people are credited with early leavened bread?", ["The Egyptians", "The Greeks", "The Celts", "The Aztecs"], 0),
+    ("Where does the wild origin of coffee lie?", ["Brazil", "Yemen", "Ethiopia", "Colombia"], 2),
+    ("Sugar cane was first domesticated in which region?", ["Spain", "New Guinea", "Brazil", "Egypt"], 1),
+    ("Rice was first cultivated in which country?", ["Japan", "India", "China", "Egypt"], 2),
+    ("Which of these crops is native to the Americas?", ["Wheat", "Barley", "Rice", "Maize (corn)"], 3),
+    ("Silk production began in which civilization?", ["Ancient China", "Ancient India", "Persia", "Rome"], 0),
+    ("What fermented fish sauce did the Romans love?", ["Miso", "Garum", "Soy sauce", "Ketchup"], 1),
+    ("The Columbian Exchange brought potatoes and tomatoes to which continent?", ["Africa", "Asia", "Europe", "Australia"], 2),
+]
+HISTORY_GAMES = ("pyramid", "quiz", "caravan")
+CARAVAN_LANES = (300, 480, 660)
+HI_DEFAULT = {"veggie": 0, "weed": 0, "memory": 0, "pyramid": 0, "quiz": 0, "caravan": 0}
+
+
+def lan_ip():
+    """The address other devices on the same WiFi can reach us on."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("10.255.255.255", 1))  # no packet is actually sent
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except OSError:
+        return "127.0.0.1"
+
+
+def roll_fish(level, perfect, hook, master=False):
+    """Picks a fish. Higher fishing level, a perfect cast, or a hook makes rarer fish more likely."""
+    boost = 1 + 0.12 * (level - 1) + (0.6 if perfect else 0.0) + (0.2 if hook else 0.0) + (0.15 if master else 0.0)
+    keys = list(FISH)
+    weights = [FISH[k]["weight"] * boost ** FISH[k]["tier"] for k in keys]
+    return random.choices(keys, weights)[0]
+
+
+class NetServer:
+    """Hosting side: accepts LAN clients, collects their positions, and sends everyone the list."""
+
+    def __init__(self, port=NET_PORT):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("0.0.0.0", port))
+        self.sock.listen(256)  # room for a crowd connecting at once
+        self.sock.settimeout(0.5)
+        self.lock = threading.Lock()
+        self.clients = {}
+        self.snapshot = []
+        self.next_id = 1
+        self.running = True
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        while self.running:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                continue
+            with self.lock:
+                full = len(self.clients) >= MAX_PLAYERS
+                if not full:
+                    cid = self.next_id
+                    self.next_id += 1
+                    self.clients[cid] = dict(conn=conn, state=None)
+            if full:
+                try:
+                    conn.sendall((json.dumps({"t": "full", "max": MAX_PLAYERS}) + "\n").encode())
+                    conn.close()
+                except OSError:
+                    pass
+                continue
+            try:
+                conn.sendall((json.dumps({"t": "hello", "id": cid}) + "\n").encode())
+            except OSError:
+                continue
+            threading.Thread(target=self._reader, args=(cid, conn), daemon=True).start()
+
+    def _reader(self, cid, conn):
+        buf = b""
+        while self.running:
+            try:
+                data = conn.recv(4096)
+            except OSError:
+                break
+            if not data:
+                break
+            buf += data
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)                try:
+                    msg = json.loads(line.decode())
+                except ValueError:
+                    continue
+                if msg.get("t") == "pos":
+                    with self.lock:
+                        if cid in self.clients:
+                            self.clients[cid]["state"] = {k: v for k, v in msg.items() if k != "t"}
+        with self.lock:
+            self.clients.pop(cid, None)
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+    def broadcast(self, host_state):
+        """Sends each client only the players in the same place who are close to them.
+        Far-away players are off-screen anyway, so 100+ players stay affordable on WiFi."""
+        with self.lock:
+            clients = [(cid, c["state"], c["conn"]) for cid, c in self.clients.items()]
+        host = dict(host_state, id=0)
+        players = [dict(st, id=cid) for cid, st, _ in clients if st]
+        self.snapshot = players + [host]
+        by_place = {}
+        for p in players + [host]:
+            by_place.setdefault(p.get("loc", "farm"), []).append(p)
+        for cid, st, conn in clients:
+            place = st.get("loc", "farm") if st else "farm"
+            mx, my = (st.get("x", 0), st.get("y", 0)) if st else (0, 0)
+            near = [p for p in by_place.get(place, [])
+                    if abs(p.get("x", 0) - mx) <= NEAR_DISTANCE and abs(p.get("y", 0) - my) <= NEAR_DISTANCE]
+            try:
+                conn.sendall((json.dumps({"t": "world", "players": near}) + "\n").encode())
+            except OSError:
+                pass
+
+    def kick(self, cid):
+        with self.lock:
+            c = self.clients.pop(cid, None)
+        if not c:
+            return False
+        try:
+            c["conn"].sendall((json.dumps({"t": "kick"}) + "\n").encode())
+            c["conn"].close()
+        except OSError:
+            pass
+        return True
+
+    def close(self):
+        self.running = False
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        with self.lock:
+            for c in self.clients.values():
+                try:
+                    c["conn"].close()
+                except OSError:
+                    pass
+            self.clients.clear()
+
+
+class ServerFull(OSError):
+    pass
+
+
+class NetClient:
+    """Joining side: sends our position and keeps the latest list of players."""
+
+    def __init__(self, host, port=NET_PORT):
+        self.sock = socket.create_connection((host, port), timeout=4)
+        self.my_id = None
+        self.players = []
+        self.alive = True
+        self.kicked = False
+        buf = self._handshake()
+        self.sock.settimeout(None)
+        threading.Thread(target=self._reader, args=(buf,), daemon=True).start()
+
+    def _handshake(self):
+        buf = b""
+        while b"\n" not in buf:
+            data = self.sock.recv(4096)
+            if not data:
+                raise OSError("the host closed the connection")
+            buf += data
+        line, rest = buf.split(b"\n", 1)
+        msg = json.loads(line.decode())
+        if msg.get("t") == "full":
+            self.sock.close()
+            raise ServerFull("That LAN game is full (%d players)." % msg.get("max", MAX_PLAYERS))
+        if msg.get("t") != "hello":
+            raise OSError("not a farming game server")
+        self.my_id = msg.get("id")
+        return rest
+
+    def _reader(self, buf=b""):
+        while self.alive:
+            try:
+                data = self.sock.recv(65536)
+            except OSError:
+                break
+            if not data:
+                break
+            buf += data
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                try:
+                    msg = json.loads(line.decode())
+                except ValueError:
+                    continue
+                if msg.get("t") == "hello":
+                    self.my_id = msg.get("id")
+                elif msg.get("t") == "world":
+                    self.players = msg.get("players", [])
+                elif msg.get("t") == "kick":
+                    self.kicked = True
+                    self.alive = False
+        self.alive = False
+
+    def send_state(self, state):
+        if not self.alive:
+            return
+        try:
+            self.sock.sendall((json.dumps(dict(state, t="pos")) + "\n").encode())
+        except OSError:
+            self.alive = False
+
+    def close(self):
+        self.alive = False
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+class Extras:
+    """Cafe, PC shop, arcade mini-games, fishing and skills."""
+
+    # ------------------------------------------------------- state and skills
+    def init_extras(self):
+        self.placing = None
+        self.owned = set()
+        self.fish_log = {}
+        self.unlocked = list(UNLOCKED_START)
+        self.menu_on = {}
+        self.cafe_open = True
+        self.rep = 20.0
+        self.xp = {"farm": 0, "cook": 0, "fish": 0}
+        self.pending = {}
+        self.hi = dict(HI_DEFAULT)
+        self.customers = []
+        self.cust_timer = 10.0
+        self.cafe_stats = dict(served=0, earned=0, tips=0, angry=0)
+        self.tables = []
+        self.location = "farm"
+        self.farm_world = None
+        self.qdone, self.qactive, self.qstats = set(), {}, {}   # quests done, active (id -> start), counters
+        self.last_port, self.cg = "farm", None
+        self.after_dialog, self.wish_idx, self.wishes_done, self.wish_opts = None, 0, set(), []
+        self.warp = None
+        if not hasattr(self, "net_server"):  # set once; new_game() must not drop a live connection
+            self.net_server = None
+            self.net_client = None
+            self.remote = []
+            self.join_text, self.join_msg = "192.168.", ""
+            self.player_name = "Farmer%d" % random.randint(10, 99)
+        self.fishing = None
+        self.mini = None
+        self.mini_result = None
+        self.recalc()
+        self.energy = float(self.max_energy)
+        self.water = self.water_cap()
+
+    def recalc(self):
+        self.max_energy = 100 + 25 * sum(1 for t in ("tonic1", "tonic2", "tonic3") if t in self.owned)
+
+    def water_cap(self):
+        return 40 if "can2" in self.owned else 20
+
+    def n_tables(self):
+        return 2 + int("table3" in self.owned) + int("table4" in self.owned)
+
+    def active_tables(self):
+        return self.tables[: self.n_tables()]
+
+    def level(self, skill):
+        return min(10, 1 + int((self.xp[skill] / 25.0) ** 0.5))
+
+    def gain_xp(self, skill, amt):
+        before = self.level(skill)
+        self.xp[skill] += amt
+        after = self.level(skill)
+        if after > before:
+            names = {"farm": "Farming", "cook": "Cooking", "fish": "Fishing"}
+            self.toast("%s level up! Lv %d" % (names[skill], after))
+            self.sparkle(self.player.x, self.player.y - 16, 10)
+
+    def cook_bonus(self):
+        return 1 + 0.03 * (self.level("cook") - 1)
+
+    def tip_mult(self):
+        return 1.0 + (0.25 if "decor" in self.owned else 0.0) + (0.1 if "trophy" in self.owned else 0.0)
+
+    def tool_cost(self, key):
+        return max(1, TOOL_COST[key] - (1 if "tools" in self.owned else 0))
+
+    def stars(self):
+        return int(clamp(self.rep, 0, 100) // 20)
+
+    def cafe_price(self, k):
+        return int(ITEMS[k]["sell"] * 1.5 * self.cook_bonus())
+
+    def cafe_menu(self):
+        return [k for k in self.unlocked if self.menu_on.get(k, True)]
+
+    # ------------------------------------------------------- cafe
+    def update_cafe(self, dt):
+        if self.location != "cafe":
+            return
+        t = self.time
+        if self.cafe_open and 9.0 <= t < 21.0 and self.cafe_menu():
+            self.cust_timer -= dt
+            if self.cust_timer <= 0:
+                free = [tb for tb in self.active_tables() if tb["cust"] is None]
+                if free and len(self.customers) < 8:
+                    self.spawn_customer(random.choice(free))
+                    self.cust_timer = max(9.0, 34 - self.rep * 0.2) + random.uniform(0, 10)
+                else:
+                    self.cust_timer = 4.0
+        for c in self.customers[:]:
+            c.anim += dt * 8
+            if c.state == "arrive":
+                tx, ty = c.table["tx"] * TILE + 8, (c.table["ty"] + 1) * TILE + 4
+                if self.walk_to(c, tx, ty, 40 * dt):
+                    c.state, c.dir = "wait", "up"
+            elif c.state == "wait":
+                c.patience -= dt
+                if c.patience <= 0:
+                    self.rep = clamp(self.rep - 6, 0, 100)
+                    self.cafe_stats["angry"] += 1
+                    self.toast("A guest left unhappy...")
+                    self.customer_leave(c)
+            elif c.state == "eat":
+                c.eat_t -= dt
+                if c.eat_t <= 0:
+                    self.customer_leave(c)
+            else:
+                if self.walk_to(c, CAFE_DOOR_IN[0], CAFE_DOOR_IN[1], 40 * dt):
+                    self.customers.remove(c)
+
+    def walk_to(self, c, x, y, step):
+        dx, dy = x - c.x, y - c.y
+        d = math.hypot(dx, dy)
+        if d <= step + 0.5:
+            c.x, c.y = x, y
+            return True
+        c.x += dx / d * step
+        c.y += dy / d * step
+        c.dir = ("right" if dx > 0 else "left") if abs(dx) > abs(dy) else ("down" if dy > 0 else "up")
+        return False
+
+    def spawn_customer(self, tb):
+        c = Customer(tb, random.choice(self.cafe_menu()), random.choice(SPR["customers"]))
+        c.x, c.y = CAFE_DOOR_IN
+        tb["cust"] = c
+        self.customers.append(c)
+
+    def customer_leave(self, c):
+        if c.table.get("cust") is c:
+            c.table["cust"] = None
+        c.state = "leave"
+
+    def serve_table(self, tb):
+        c = tb["cust"]
+        if c is None:
+            self.toast("This table is empty.")
+            return
+        if c.state != "wait":
+            return
+        if self.inv.get(c.order, 0) <= 0:
+            self.toast("They want %s. Cook it in the Kitchen!" % ITEMS[c.order]["name"], c.order)
+            return
+        self.take_item(c.order)
+        frac = c.patience / c.max_patience
+        price = self.cafe_price(c.order)
+        tip = int(price * (0.25 if frac > 0.66 else 0.1 if frac > 0.33 else 0.0) * self.tip_mult())
+        total = price + tip
+        self.money += total
+        st = self.cafe_stats
+        st["served"] += 1
+        st["earned"] += total
+        st["tips"] += tip
+        self.rep = clamp(self.rep + (3 if frac > 0.33 else 1), 0, 100)
+        c.state, c.eat_t = "eat", 4.0
+        self.qinc("serve")
+        self.gain_xp("cook", 8)
+        self.heart(c.x, c.y - 26)
+        self.sparkle(c.x, c.y - 12, 6)
+        self.toast("Served %s: +%dg%s" % (ITEMS[c.order]["name"], total, (" (tip %dg)" % tip) if tip else ""), "coin")
+
+    def draw_bubbles(self, surf_, cx, cy):
+        for c in self.customers:
+            if c.state != "wait":
+                continue
+            x, y = int(c.x - cx), int(c.y - cy)
+            r = pygame.Rect(x - 11, y - 50, 22, 24)
+            pygame.draw.rect(surf_, (255, 250, 240), r, border_radius=5)
+            pygame.draw.rect(surf_, (60, 40, 30), r, 1, border_radius=5)
+            pygame.draw.polygon(surf_, (255, 250, 240), [(x - 3, y - 27), (x + 3, y - 27), (x, y - 23)])
+            surf_.blit(self.icons[c.order], (x - 8, y - 49))
+            frac = clamp(c.patience / c.max_patience, 0, 1)
+            surf_.fill((60, 40, 30), (x - 9, y - 31, 18, 3))
+            surf_.fill(lerp_col((220, 70, 60), (110, 200, 80), frac), (x - 9, y - 31, int(18 * frac), 3))
+
+    def draw_cafe_stars(self):
+        scr = self.screen
+        r = pygame.Rect(WIN_W - 196, 134, 184, 30)
+        pygame.draw.rect(scr, INK, r.inflate(4, 4), border_radius=10)
+        pygame.draw.rect(scr, (120, 84, 54), r, border_radius=8)
+        self.text("Cafe", (r.x + 10, r.y + 6), self.f_s, CREAM)
+        if not self.cafe_open:
+            self.text("CLOSED", (r.right - 10, r.y + 6), self.f_s, (240, 120, 100), right=True)
+            return
+        st = self.stars()
+        for i in range(5):
+            draw_star(scr, r.right - 92 + i * 18, r.y + 15, 8, GOLD if i < st else (92, 64, 44))
+
+    # ------------------------------------------------------- PC shop
+    def pc_entries(self, tab):
+        if tab == 0:
+            return [k + "_seed" for k in CROPS]
+        if tab == 1:
+            return list(PANTRY)
+        if tab == 2:
+            return [k for k in RECIPE_PRICE if k not in self.unlocked]
+        if tab == 3:
+            return [k for k in UPGRADES if k not in self.owned]
+        return self.trade_entries()
+
+    def market_mult(self, k):
+        """Today's market multiplier for an item: the same all day, different tomorrow."""
+        rng = random.Random(self.day * 7919 + sum(ord(c) for c in k) * 31)
+        return round(0.75 + rng.random() * 0.6, 2)
+
+    def trade_price(self, kind, k):
+        base = ITEMS[k]["sell"] * self.market_mult(k)
+        return max(1, int(base)) if kind == "sell" else int(base * 1.25) + 1
+
+    def trade_entries(self):
+        sells = sorted(k for k, n in self.inv.items() if n > 0
+                       and ITEMS.get(k, {}).get("kind") in ("crop", "mat", "food", "seed")
+                       and ITEMS[k].get("sell", 0) > 0)
+        buys = sorted(k for k, v in ITEMS.items()
+                      if v.get("kind") in ("crop", "mat", "food") and v.get("sell", 0) > 0)
+        return [("sell", k) for k in sells] + [("buy", k) for k in buys]
+
+    def trade(self, kind, k, qty):
+        price = self.trade_price(kind, k)
+        name = ITEMS[k]["name"]
+        if kind == "sell":
+            n = min(qty, self.inv.get(k, 0))
+            if n <= 0:
+                self.toast("You have none of that to sell.")
+                return
+            self.take_item(k, n)
+            self.money += price * n
+            self.toast("Sold %d %s for %dg" % (n, name, price * n), "coin")
+        else:
+            if self.money < price * qty:
+                self.toast("Not enough gold!")
+                return
+            self.money -= price * qty
+            self.add_item(k, qty, quiet=True)
+            self.toast("Bought %d %s for %dg" % (qty, name, price * qty), k)
+
+    def trade_row(self, entry, rr):
+        kind, k = entry
+        price = self.trade_price(kind, k)
+        self.icon(k, (rr.x + 10, rr.y + 7), 2)
+        tag = "SELL" if kind == "sell" else "BUY"
+        self.text("%s  %s" % (tag, ITEMS[k]["name"]), (rr.x + 54, rr.y + 4), self.f_m, TEXT)
+        self.text("Market x%.2f.  You have %d." % (self.market_mult(k), self.inv.get(k, 0)),
+                  (rr.x + 54, rr.y + 28), self.f_s, PANEL_D)
+        ok = kind == "sell" or self.money >= price
+        self.text("%dg" % price, (rr.right - 14, rr.y + 12), self.f_m, TEXT if ok else (170, 50, 40), right=True)
+
+    def pc_price(self, tab, k):
+        if tab == 0:
+            return max(1, int(ITEMS[k]["buy"] * 0.85))
+        if tab == 1:
+            return PANTRY[k]
+        if tab == 2:
+            return RECIPE_PRICE[k]
+        return UPGRADES[k]["price"]
+
+    def pc_buy(self, tab, k, n):
+        price = self.pc_price(tab, k)
+        if tab in (0, 1):
+            if self.money < price * n:
+                self.toast("Not enough gold!")
+                return
+            self.money -= price * n
+            self.pending[k] = self.pending.get(k, 0) + n
+            self.toast("Ordered %d x %s. Arrives tomorrow!" % (n, ITEMS[k]["name"]), k)
+        elif tab == 2:
+            if self.money < price:
+                self.toast("Not enough gold!")
+                return
+            self.money -= price
+            self.unlocked = [r for r in RECIPES if r in self.unlocked or r == k]
+            self.menu_on[k] = True
+            self.toast("New recipe learned: %s!" % RECIPES[k]["name"], k)
+        else:
+            req = UPG_REQ.get(k)
+            if req and req not in self.owned:
+                self.toast("You need '%s' first." % UPGRADES[req]["name"])
+                return
+            if self.money < price:
+                self.toast("Not enough gold!")
+                return
+            self.money -= price
+            self.owned.add(k)
+            self.recalc()
+            if k == "can2":
+                self.water = self.water_cap()
+            if k.startswith("tonic"):
+                self.energy = min(self.max_energy, self.energy + 25)
+            if k.startswith("table"):
+                self.rebuild_solid()
+            self.toast("Bought: %s" % UPGRADES[k]["name"], UPGRADES[k]["icon"])
+
+    def row_box(self, rr, sel):
+        if sel:
+            pygame.draw.rect(self.screen, (252, 224, 150), rr, border_radius=8)
+            pygame.draw.rect(self.screen, GOLD, rr, 3, border_radius=8)
+        else:
+            pygame.draw.rect(self.screen, (236, 200, 144), rr, border_radius=8)
+
+    def draw_rows(self, r, top, entries, m, rows, row_fn, row_h=52):
+        m["idx"] = clamp(m["idx"], 0, max(0, len(entries) - 1))
+        m["scroll"] = clamp(m.get("scroll", 0), max(0, m["idx"] - rows + 1), m["idx"])
+        for vi in range(rows):
+            i = m["scroll"] + vi
+            if i >= len(entries):
+                break
+            rr = pygame.Rect(r.x + 20, top + vi * row_h, r.w - 40, row_h - 6)
+            self.row_box(rr, i == m["idx"])
+            row_fn(entries[i], rr)
+
+    # ------------------------------------------------------- history mini-games
+    def history_start(self, kind):
+        m = dict(kind=kind, score=0, fx=[], t=0.0)
+        if kind == "pyramid":
+            m.update(lives=1, blocks=[(390.0, 570.0)], cx=480.0, osc=0.0, bonus=0)
+        elif kind == "quiz":
+            m.update(lives=3, qs=random.sample(QUIZ, 8), idx=0, timer=10.0, lock=0.0, picked=None)
+        else:
+            m.update(lives=3, time=60.0, lane=1, items=[], spawn=0.5)
+        self.mini = m
+        self.menu = {}
+        self.state = "mini"
+
+    def history_update(self, dt):
+        m = self.mini
+        m["t"] += dt
+        for f in m["fx"]:
+            f["t"] -= dt
+        m["fx"] = [f for f in m["fx"] if f["t"] > 0]
+        if m["kind"] == "pyramid":
+            m["osc"] += dt * (1.5 + 0.08 * len(m["blocks"]))
+            m["cx"] = 480 + math.sin(m["osc"]) * 230
+        elif m["kind"] == "quiz":
+            if m["lock"] > 0:
+                m["lock"] -= dt
+                if m["lock"] <= 0:
+                    m["idx"] += 1
+                    m["timer"], m["picked"] = 10.0, None
+                    if m["idx"] >= len(m["qs"]) or m["lives"] <= 0:
+                        self.end_mini()
+                return
+            m["timer"] -= dt
+            if m["timer"] <= 0:
+                self.quiz_answer(-1)
+        else:
+            m["time"] -= dt
+            m["spawn"] -= dt
+            if m["spawn"] <= 0:
+                m["spawn"] = max(0.28, 0.6 - m["t"] * 0.003)
+                r = random.random()
+                kind = "bandit" if r < 0.25 else "silk" if r < 0.35 else "spice"
+                m["items"].append(dict(lane=random.randrange(3), y=-20.0, kind=kind,
+                                       sp=170 + m["t"] * 2.5))
+            keep = []
+            for it in m["items"]:
+                it["y"] += it["sp"] * dt
+                x = CARAVAN_LANES[it["lane"]]
+                if 478 < it["y"] < 512 and it["lane"] == m["lane"]:
+                    if it["kind"] == "bandit":
+                        m["lives"] -= 1
+                        self.pop_fx(x, 470, "Bandit!", (255, 120, 120))
+                    else:
+                        pts = 30 if it["kind"] == "silk" else 10
+                        m["score"] += pts
+                        self.pop_fx(x, 470, "+%d" % pts)
+                    continue
+                if it["y"] < 560:
+                    keep.append(it)
+            m["items"] = keep
+            if m["lives"] <= 0 or m["time"] <= 0:
+                self.end_mini()
+
+    def pyramid_drop(self):
+        m = self.mini
+        l, r = m["blocks"][-1]
+        w = r - l
+        cx = m["cx"]
+        nl, nr = max(cx - w / 2, l), min(cx + w / 2, r)
+        if nr - nl < 6:
+            self.end_mini()
+            return
+        if abs(cx - (l + r) / 2) < 4:
+            m["bonus"] += 1
+            self.pop_fx(480, 260, "Perfect!", GOLD)
+        m["blocks"].append((nl, nr))
+        m["score"] = len(m["blocks"]) - 1 + m["bonus"]
+
+    def quiz_answer(self, choice):
+        m = self.mini
+        if m["lock"] > 0:
+            return
+        correct = m["qs"][m["idx"]][2]
+        m["picked"] = choice
+        if choice == correct:
+            m["score"] += 10 + int(max(0, m["timer"]))
+            self.pop_fx(480, 250, "Correct!", (150, 255, 150))
+        else:
+            m["lives"] -= 1
+            self.pop_fx(480, 250, "Not quite!", (255, 140, 120))
+        m["lock"] = 1.6
+
+    def quiz_boxes(self):
+        return [pygame.Rect(170, 300, 300, 92), pygame.Rect(490, 300, 300, 92),
+                pygame.Rect(170, 408, 300, 92), pygame.Rect(490, 408, 300, 92)]
+
+    def history_key(self, ev):
+        m = self.mini
+        k = ev.key
+        if k == pygame.K_ESCAPE:
+            self.end_mini()
+            return
+        if m["kind"] == "pyramid":
+            if k in (pygame.K_SPACE, pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_UP):
+                self.pyramid_drop()
+        elif m["kind"] == "quiz":
+            choice = {pygame.K_1: 0, pygame.K_2: 1, pygame.K_3: 2, pygame.K_4: 3}.get(k)
+            if choice is not None:
+                self.quiz_answer(choice)
+        else:
+            if k in (pygame.K_LEFT, pygame.K_a):
+                m["lane"] = clamp(m["lane"] - 1, 0, 2)
+            elif k in (pygame.K_RIGHT, pygame.K_d):
+                m["lane"] = clamp(m["lane"] + 1, 0, 2)
+
+    def history_tap(self, x, y):
+        m = self.mini
+        if m["kind"] == "pyramid":
+            self.pyramid_drop()
+        elif m["kind"] == "quiz":
+            for i, rr in enumerate(self.quiz_boxes()):
+                if rr.collidepoint(x, y):
+                    self.quiz_answer(i)
+                    return
+        else:
+            m["lane"] = clamp(m["lane"] + (-1 if x < 480 else 1), 0, 2)
+
+    def wrap_text(self, text, width):
+        lines, line = [], ""
+        for w in text.split():
+            test = (line + " " + w).strip()
+            if line and self.f_m.size(test)[0] > width:
+                lines.append(line)
+                line = w
+            else:
+                line = test
+        if line:
+            lines.append(line)
+        return lines
+
+    def history_draw(self):
+        m = self.mini
+        if m["kind"] == "pyramid":
+            self.draw_pyramid()
+        elif m["kind"] == "quiz":
+            self.draw_quiz()
+        else:
+            self.draw_caravan()
+        for f in m["fx"]:
+            self.text(f["s"], (f["x"], f["y"] - (0.7 - f["t"]) * 60), self.f_m, f["c"], shadow=INK, center=True)
+
+    def draw_pyramid(self):
+        m = self.mini
+        scr = self.screen
+        for y in range(WIN_H):
+            pygame.draw.line(scr, lerp_col((250, 220, 160), (226, 184, 116), y / WIN_H), (0, y), (WIN_W, y))
+        pygame.draw.circle(scr, (255, 236, 170), (800, 90), 40)
+        pygame.draw.polygon(scr, (206, 170, 112), [(40, 640), (330, 230), (620, 640)])
+        pygame.draw.polygon(scr, (182, 146, 92), [(330, 230), (620, 640), (420, 640)])
+        shift = max(0, (len(m["blocks"]) - 10) * 22)
+        cols = [(196, 160, 100), (214, 180, 120), (182, 146, 90)]
+        for k, (l, r) in enumerate(m["blocks"]):
+            top = 560 - (k + 1) * 22 + shift
+            rr = pygame.Rect(int(l), int(top), int(r - l), 20)
+            pygame.draw.rect(scr, cols[k % 3], rr, border_radius=3)
+            pygame.draw.rect(scr, (120, 88, 52), rr, 2, border_radius=3)
+            pygame.draw.line(scr, (150, 116, 72), (rr.x + 6, rr.centery), (rr.right - 6, rr.centery), 1)
+        w = m["blocks"][-1][1] - m["blocks"][-1][0]
+        rr = pygame.Rect(int(m["cx"] - w / 2), 110, int(w), 20)
+        pygame.draw.rect(scr, (240, 210, 140), rr, border_radius=3)
+        pygame.draw.rect(scr, (120, 88, 52), rr, 2, border_radius=3)
+        self.text("Pyramid Builder - Ancient Egypt", (WIN_W // 2, 16), self.f_l, (80, 50, 20), center=True)
+        self.text("Space / Enter / tap: drop the block. Stay centered for Perfect!", (WIN_W // 2, 58), self.f_s, (80, 50, 20), center=True)
+        self.text("Blocks %d   Perfect x%d   Score %d" % (len(m["blocks"]) - 1, m["bonus"], m["score"]), (20, 600), self.f_m, (80, 50, 20))
+
+    def draw_quiz(self):
+        m = self.mini
+        scr = self.screen
+        scr.fill((30, 40, 70))
+        panel = pygame.Rect(110, 40, 740, 560)
+        self.panel(panel)
+        self.text("Food Through the Ages", (panel.centerx, panel.y + 16), self.f_l, TEXT, center=True)
+        n = len(m["qs"])
+        self.text("Question %d / %d" % (min(m["idx"] + 1, n), n), (panel.x + 24, panel.y + 56), self.f_s, PANEL_D)
+        self.text("Score %d" % m["score"], (panel.right - 24, panel.y + 56), self.f_s, PANEL_D, right=True)
+        for i in range(m["lives"]):
+            draw_heart(scr, panel.x + 30 + i * 28, panel.y + 92, 9, (240, 90, 120))
+        q, opts, correct = m["qs"][min(m["idx"], n - 1)]
+        y = panel.y + 120
+        for line in self.wrap_text(q, panel.w - 80):
+            self.text(line, (panel.centerx, y), self.f_m, TEXT, center=True)
+            y += 28
+        for i, (rr, opt) in enumerate(zip(self.quiz_boxes(), opts)):
+            col = PANEL_L
+            if m["lock"] > 0:
+                if i == correct:
+                    col = (150, 220, 130)
+                elif i == m["picked"]:
+                    col = (240, 150, 140)
+            pygame.draw.rect(scr, INK, rr.inflate(6, 6), border_radius=10)
+            pygame.draw.rect(scr, col, rr, border_radius=8)
+            lines = self.wrap_text("%d.  %s" % (i + 1, opt), rr.w - 24)
+            yy = rr.centery - len(lines) * 12
+            for line in lines:
+                self.text(line, (rr.centerx, yy), self.f_m, TEXT, center=True)
+                yy += 24
+        if m["lock"] <= 0:
+            frac = clamp(m["timer"] / 10.0, 0, 1)
+            pygame.draw.rect(scr, (60, 50, 40), (panel.x + 24, panel.bottom - 30, panel.w - 48, 12), border_radius=6)
+            pygame.draw.rect(scr, (240, 170, 60), (panel.x + 24, panel.bottom - 30, int((panel.w - 48) * frac), 12), border_radius=6)
+        self.text("Press 1-4 or tap an answer", (panel.centerx, panel.bottom - 50), self.f_s, PANEL_D, center=True)
+
+    def draw_caravan(self):
+        m = self.mini
+        scr = self.screen
+        scr.fill((214, 186, 130))
+        for i in range(6):
+            pygame.draw.ellipse(scr, (200, 168, 112), (i * 190 - 50, 60 + (i % 2) * 90, 260, 90))
+        pygame.draw.rect(scr, (232, 206, 150), (230, 0, 500, WIN_H))
+        off = int(m["t"] * 120) % 50
+        for y in range(-50, WIN_H, 50):
+            pygame.draw.rect(scr, (200, 170, 118), (476, y + off, 8, 24))
+        for lx in CARAVAN_LANES:
+            for y in range(0, WIN_H, 24):
+                pygame.draw.rect(scr, (220, 190, 136), (lx - 1, y, 2, 12))
+        for it in m["items"]:
+            x, y = CARAVAN_LANES[it["lane"]], int(it["y"])
+            if it["kind"] == "spice":
+                pygame.draw.circle(scr, (214, 110, 40), (x, y), 14)
+                pygame.draw.circle(scr, (250, 190, 90), (x - 4, y - 4), 4)
+            elif it["kind"] == "silk":
+                pygame.draw.circle(scr, (240, 220, 120), (x, y), 14)
+                pygame.draw.circle(scr, (255, 252, 236), (x - 4, y - 4), 4)
+            else:
+                pygame.draw.polygon(scr, (150, 40, 40), [(x - 16, y + 12), (x + 16, y + 12), (x, y - 14)])
+                pygame.draw.circle(scr, (255, 255, 255), (x - 5, y + 2), 2)
+                pygame.draw.circle(scr, (255, 255, 255), (x + 5, y + 2), 2)
+        x = CARAVAN_LANES[m["lane"]]
+        pygame.draw.ellipse(scr, (196, 150, 90), (x - 34, 486, 68, 30))
+        pygame.draw.ellipse(scr, (196, 150, 90), (x - 14, 470, 26, 22))
+        for lx in (x - 26, x + 20):
+            pygame.draw.rect(scr, (176, 130, 78), (lx, 510, 6, 18))
+        pygame.draw.circle(scr, (196, 150, 90), (x + 34, 484), 10)
+        pygame.draw.rect(scr, (196, 150, 90), (x + 30, 486, 6, 16))
+        self.text("Silk Road Caravan - Left/Right, A/D or tap a side", (WIN_W // 2, 16), self.f_m, (80, 50, 20), center=True)
+        self.text("Time %d    Score %d" % (max(0, int(m["time"])), m["score"]), (20, 600), self.f_m, (80, 50, 20))
+        for i in range(m["lives"]):
+            draw_heart(scr, WIN_W - 30 - i * 28, 600, 9, (200, 60, 70))
+
+    HOUSE_W, HOUSE_H = 6, 5
+
+    def house_problem(self, tx, ty, check_player=True):
+        """Why a villager house cannot go at tile (tx, ty), or None when it can."""
+        if self.location != "farm":
+            return "build on the farm"
+        if tx < 2 or ty < 2 or tx + self.HOUSE_W > MAP_W - 2 or ty + self.HOUSE_H > MAP_H - 2:
+            return "outside the map"
+        ptile = (int(self.player.x) // TILE, int(self.player.y) // TILE)
+        for yy in range(ty, ty + self.HOUSE_H):
+            for xx in range(tx, tx + self.HOUSE_W):
+                tt = self.tiles[yy][xx]
+                if tt == WATER:
+                    return "on the water"
+                if tt == BRIDGE:
+                    return "on the bridge"
+                if tt in (WALL, WOOD_FLOOR):
+                    return "inside another building"
+                if (xx, yy) in self.bld_at:
+                    return "another building is there"
+                o = self.objs.get((xx, yy))
+                if o and o["t"] in ("tree", "stump"):
+                    return "a tree is in the way"
+                if o and o["t"] == "rock":
+                    return "a rock is in the way"
+                if (xx, yy) in self.soil:
+                    return "that is farm soil"
+                if check_player and (xx, yy) == ptile:
+                    return "you are standing there"
+        for n in self.npcs:
+            nx, ny = int(n.x) // TILE, int(n.y) // TILE
+            if tx <= nx < tx + self.HOUSE_W and ty <= ny < ty + self.HOUSE_H:
+                return "a villager is standing there"
+        return None
+
+    def add_building(self, tx, ty):
+        """Adds a player-built house. Solid walls come from bld_at via rebuild_solid()."""
+        house = dict(kind="player_villager_house", tx=tx, ty=ty, w=self.HOUSE_W, h=self.HOUSE_H, player_built=True)
+        self.buildings.append(house)
+        for yy in range(ty, ty + self.HOUSE_H):
+            for xx in range(tx, tx + self.HOUSE_W):
+                self.bld_at[(xx, yy)] = house
+                self.objs.pop((xx, yy), None)     # only flowers can be under a valid spot
+                self.reserved.add((xx, yy))
+        self.rebuild_solid()
+
+    def start_placing(self):
+        if self.location != "farm":
+            self.toast("Go back to the farm to build a house.")
+            return
+        if self.inv.get("villager_house_kit", 0) <= 0:
+            self.toast("You need a Villager House Kit. Craft one at the workbench.")
+            return
+        px, py = int(self.player.x) // TILE, int(self.player.y) // TILE
+        self.placing = dict(tx=px + 2, ty=py - 2, hold=(0, 0), timer=0.0)
+        self.state = "place"
+        self.toast("Choose a spot. Arrows move, Enter or Space builds, Esc cancels.")
+
+    def cancel_placing(self):
+        self.placing = None
+        self.state = "play"
+        self.toast("Building cancelled. Your house kit is still in your pack.")
+
+    def place_house(self):
+        p = self.placing
+        if p is None:
+            return False
+        reason = self.house_problem(p["tx"], p["ty"])
+        if reason:
+            self.toast("Can't build there: %s." % reason)
+            return False
+        self.take_item("villager_house_kit", 1)
+        self.add_building(p["tx"], p["ty"])
+        self.placing = None
+        self.state = "play"
+        self.sparkle(p["tx"] * TILE + 48, p["ty"] * TILE + 40, 12)
+        self.qinc("house")
+        self.toast("Villager house built!")
+        return True
+
+    def placing_move(self, dx, dy):
+        p = self.placing
+        p["tx"] = clamp(p["tx"] + dx, 0, MAP_W - self.HOUSE_W)
+        p["ty"] = clamp(p["ty"] + dy, 0, MAP_H - self.HOUSE_H)
+
+    def placing_update(self, dt):
+        p = self.placing
+        if p is None:
+            self.state = "play"
+            return
+        keys = pygame.key.get_pressed()
+        dx = int(bool(keys[pygame.K_d] or keys[pygame.K_RIGHT])) - int(bool(keys[pygame.K_a] or keys[pygame.K_LEFT]))
+        dy = int(bool(keys[pygame.K_s] or keys[pygame.K_DOWN])) - int(bool(keys[pygame.K_w] or keys[pygame.K_UP]))
+        d = (dx, dy)
+        if d == (0, 0):
+            p["hold"], p["timer"] = d, 0.0
+            return
+        if d != p["hold"]:                       # first frame of a press: one step
+            self.placing_move(dx, dy)
+            p["hold"], p["timer"] = d, 0.25
+            return
+        p["timer"] -= dt                         # held: repeat steps
+        if p["timer"] <= 0:
+            self.placing_move(dx, dy)
+            p["timer"] = 0.12
+
+    def placing_key(self, ev):
+        k = ev.key
+        if k == pygame.K_ESCAPE:
+            self.cancel_placing()
+        elif k in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_KP_ENTER, pygame.K_e):
+            self.place_house()
+
+    def placing_pointer(self, vx, vy, click=False):
+        """Mouse or touch: the house follows the pointer and a click builds it."""
+        if self.placing is None:
+            return
+        cam = self.camera()
+        tx = int((vx / SCALE + cam[0]) // TILE) - self.HOUSE_W // 2
+        ty = int((vy / SCALE + cam[1]) // TILE) - self.HOUSE_H // 2
+        self.placing["tx"] = clamp(tx, 0, MAP_W - self.HOUSE_W)
+        self.placing["ty"] = clamp(ty, 0, MAP_H - self.HOUSE_H)
+        if click:
+            self.place_house()
+
+    def draw_placing(self):
+        p = self.placing
+        if p is None:
+            return
+        cam = self.camera()
+        reason = self.house_problem(p["tx"], p["ty"])
+        scr = self.screen
+        x0 = (p["tx"] * TILE - cam[0]) * SCALE
+        y0 = (p["ty"] * TILE - cam[1]) * SCALE
+        w, h = self.HOUSE_W * TILE * SCALE, self.HOUSE_H * TILE * SCALE
+        ghost = pygame.transform.scale(SPR["player_house"], (w, h))
+        ghost.set_alpha(170)
+        scr.blit(ghost, (x0, y0))
+        pygame.draw.rect(scr, (110, 230, 110) if reason is None else (240, 90, 80), (x0, y0, w, h), 3, border_radius=6)
+        self.panel(pygame.Rect(WIN_W // 2 - 300, 14, 600, 62))
+        self.text("Build the Villager House", (WIN_W // 2, 22), self.f_m, TEXT, center=True)
+        if reason is None:
+            self.text("Good spot - press Enter or Space to build", (WIN_W // 2, 48), self.f_s, (60, 120, 60), center=True)
+        else:
+            self.text("Not here: %s" % reason, (WIN_W // 2, 48), self.f_s, (170, 50, 40), center=True)
+        self.text("Arrows / WASD move     Enter or Space build     Esc cancel",
+                  (WIN_W // 2, WIN_H - 26), self.f_s, CREAM, shadow=INK, center=True)
+
+    def bench_craft(self, key):
+        r = WORKBENCH[key]
+        if key in self.owned:
+            self.toast("You already have the %s." % r["name"])
+            return
+        if not all(self.inv.get(i, 0) >= n for i, n in r["needs"].items()):
+            self.toast("Missing materials for the %s." % r["name"])
+            return
+        for i, n in r["needs"].items():
+            self.take_item(i, n)
+        if key == "villager_house":
+            self.add_item("villager_house_kit", 1, quiet=True)
+            self.toast("Villager House Kit crafted! Choose where to build it.")
+            self.start_placing()
+            return
+        self.owned.add(key)
+        if key == "can2":
+            self.water = self.water_cap()
+        self.gain_xp("farm", 10)
+        self.toast("Crafted: %s" % r["name"])
+
+    def draw_bench(self):
+        m = self.menu
+        r = pygame.Rect(WIN_W // 2 - 330, WIN_H // 2 - 250, 660, 500)
+        self.panel(r)
+        self.text("Workbench", (r.x + 24, r.y + 18), self.f_l, TEXT)
+        self.text("Gather wood and stone on the farm, then craft here.", (r.x + 24, r.y + 56), self.f_s, PANEL_D)
+        keys = list(WORKBENCH)
+
+        def row(k, rr):
+            rec = WORKBENCH[k]
+            self.text(rec["name"], (rr.x + 14, rr.y + 4), self.f_m, TEXT)
+            self.text(rec["desc"], (rr.x + 14, rr.y + 28), self.f_s, PANEL_D)
+            x = rr.right - 14
+            if k in self.owned:
+                self.text("Built", (x, rr.y + 14), self.f_m, (50, 120, 50), right=True)
+                return
+            parts = ["%d %s" % (n, ITEMS[i]["name"]) for i, n in rec["needs"].items()]
+            ok = all(self.inv.get(i, 0) >= n for i, n in rec["needs"].items())
+            self.text(", ".join(parts), (x, rr.y + 14), self.f_s, TEXT if ok else (170, 50, 40), right=True)
+
+        self.draw_rows(r, r.y + 90, keys, m, 6, row, row_h=60)
+        self.text("Enter: craft     Esc: close", (r.centerx, r.bottom - 26), self.f_s, PANEL_D, center=True)
+
+    def pause_items(self):
+        items = ["Resume", "Save game", "Save and quit to title", "Help", "Fish journal"]
+        if CAN_HOST:
+            items += ["Host LAN game", "Stop hosting", "Admin panel"]
+        return items
+
+    def admin_actions(self):
+        """(label, function) pairs for the host's admin panel."""
+        def give_seeds():
+            for k in CROPS:
+                self.add_item(k + "_seed", 10, quiet=True)
+            self.toast("Admin: 10 of every crop seed")
+
+        def give_fish():
+            for k in FISH:
+                self.add_item(k, 5, quiet=True)
+            self.toast("Admin: 5 of every fish")
+
+        def give_gold():
+            self.money += 500
+            self.toast("Admin: +500g")
+
+        def set_noon():
+            self.time = 12.0
+            self.toast("Admin: time set to 12:00")
+
+        def refill():
+            self.energy = float(self.max_energy)
+            self.water = self.water_cap()
+            self.toast("Admin: energy and water refilled")
+
+        def toggle_rain():
+            self.rain = not self.rain
+            self.toast("Admin: rain %s" % ("on" if self.rain else "off"))
+
+        actions = [("Give 10 of every crop seed", give_seeds), ("Give 5 of every fish", give_fish),
+                   ("Give 500 gold", give_gold), ("Set time to 12:00", set_noon),
+                   ("Refill energy and water", refill), ("Toggle rain", toggle_rain)]
+        if self.net_server:
+            for p in self.remote:
+                pid, name = p.get("id"), p.get("name", "player")
+                actions.append(("Teleport to " + name, (lambda p=p: self.admin_teleport(p))))
+                actions.append(("Kick " + name, (lambda pid=pid, name=name: self.admin_kick(pid, name))))
+        return actions
+
+    def admin_teleport(self, p):
+        if p.get("loc") != self.location:
+            self.toast("That player is not in the same place as you.")
+            return
+        self.player.x, self.player.y = p["x"], p["y"]
+        self.toast("Admin: teleported to %s" % p.get("name", "player"))
+
+    def admin_kick(self, pid, name):
+        if self.net_server and self.net_server.kick(pid):
+            self.toast("Admin: kicked %s" % name)
+            self.remote = [r for r in self.remote if r.get("id") != pid]
+
+    def draw_admin_menu(self):
+        m = self.menu
+        entries = self.admin_actions()
+        r = pygame.Rect(WIN_W // 2 - 300, WIN_H // 2 - 230, 600, 460)
+        self.panel(r)
+        self.text("Admin panel", (r.centerx, r.y + 18), self.f_l, TEXT, center=True)
+        self.text("Only the host can see this. Esc closes it.", (r.centerx, r.y + 52), self.f_s, PANEL_D, center=True)
+        m["idx"] = clamp(m["idx"], 0, max(0, len(entries) - 1))
+        for i, (label, _) in enumerate(entries[:9]):
+            rr = pygame.Rect(r.x + 30, r.y + 84 + i * 40, r.w - 60, 34)
+            if m["idx"] == i:
+                pygame.draw.rect(self.screen, GOLD, rr, border_radius=6)
+            self.text(label, rr.center, self.f_m, TEXT, center=True)
+        self.text("Up/Down + Enter", (r.centerx, r.bottom - 26), self.f_s, PANEL_D, center=True)
+
+    def draw_journal(self):
+        m = self.menu
+        r = pygame.Rect(WIN_W // 2 - 300, WIN_H // 2 - 240, 600, 480)
+        self.panel(r)
+        n, title, bonus = self.fish_mastery()
+        self.text("Fish Journal", (r.centerx, r.y + 16), self.f_l, TEXT, center=True)
+        self.text("%s - %d of %d species caught (+%d%% fish sell)" % (title, n, len(FISH), int(bonus * 100)),
+                  (r.centerx, r.y + 52), self.f_s, PANEL_D, center=True)
+        keys = list(FISH)
+
+        def row(k, rr):
+            caught = self.fish_log.get(k, 0)
+            self.icon(k, (rr.x + 10, rr.y + 7), 2)
+            self.text(FISH[k]["name"] if caught else "???", (rr.x + 54, rr.y + 4), self.f_m, TEXT)
+            sub = ("Caught %d - sells %dg" % (caught, FISH[k]["sell"])) if caught else "Not caught yet"
+            self.text(sub, (rr.x + 54, rr.y + 28), self.f_s, PANEL_D)
+            if FISH[k]["tier"] >= 3:
+                self.text("RARE", (rr.right - 14, rr.y + 14), self.f_s, (200, 120, 40), right=True)
+
+        self.draw_rows(r, r.y + 84, keys, m, 7, row)
+        self.text("Up/Down to scroll. Esc to close.", (r.centerx, r.bottom - 26), self.f_s, PANEL_D, center=True)
+
+    def admin_key(self, ev):
+        m = self.menu
+        entries = self.admin_actions()
+        k = ev.key
+        if k in (pygame.K_UP, pygame.K_w):
+            m["idx"] = max(0, m["idx"] - 1)
+        elif k in (pygame.K_DOWN, pygame.K_s):
+            m["idx"] = min(max(0, len(entries) - 1), m["idx"] + 1)
+        elif k in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_KP_ENTER) and entries:
+            entries[clamp(m["idx"], 0, len(entries) - 1)][1]()
+
+    def draw_pc(self):
+        m = self.menu
+        tab = m["tab"]
+        scr = self.screen        r = pygame.Rect(WIN_W // 2 - 340, WIN_H // 2 - 270, 680, 540)
+        pygame.draw.rect(scr, (30, 34, 44), r.inflate(28, 28), border_radius=16)
+        pygame.draw.rect(scr, (222, 236, 248), r, border_radius=8)
+        pygame.draw.rect(scr, (40, 90, 170), (r.x, r.y, r.w, 44), border_radius=8)
+        self.text("FarmNet Shop", (r.x + 18, r.y + 10), self.f_l, (255, 255, 255))
+        self.icon("coin", (r.right - 150, r.y + 6), 2)
+        self.text("%sg" % format(self.money, ","), (r.right - 112, r.y + 12), self.f_m, (255, 255, 255))
+        for i, nm in enumerate(("Seeds", "Pantry", "Recipes", "Upgrades", "Trading")):
+            tr = pygame.Rect(r.x + 14 + i * 133, r.y + 54, 127, 34)
+            pygame.draw.rect(scr, (255, 255, 255) if i == tab else (190, 206, 226), tr, border_radius=6)
+            pygame.draw.rect(scr, (40, 90, 170), tr, 2, border_radius=6)
+            self.text(nm, tr.center, self.f_m, (30, 60, 120), center=True)
+        hints = ["Delivered tomorrow morning. 15% cheaper than the shop!",
+                 "Ingredients for cafe recipes. Delivered tomorrow morning.",
+                 "Learn new dishes. Guests will order them once unlocked.",
+                 "Permanent upgrades. Effects apply immediately.",
+                 "Sell goods at today's market price, or buy ingredients. Prices change every day."]
+        self.text(hints[tab], (r.x + 20, r.y + 98), self.f_s, (60, 80, 120))
+        entries = self.pc_entries(tab)
+        if not entries:
+            self.text("Everything in this tab is already yours!", (r.centerx, r.centery), self.f_m, (60, 80, 120), center=True)
+
+        def row(k, rr):
+            if tab == 4:
+                self.trade_row(k, rr)
+                return
+            if tab == 0:
+                c = CROPS[ITEMS[k]["crop"]]
+                icon, name = k, ITEMS[k]["name"]
+                sub = "Grows in %d days. Sells for %dg." % (c["days"], c["sell"])
+            elif tab == 1:
+                icon, name = k, ITEMS[k]["name"]
+                sub = "You have %d." % self.inv.get(k, 0)
+            elif tab == 2:
+                icon, name = k, RECIPES[k]["name"]
+                sub = "Needs: " + ", ".join("%d %s" % (n, ITEMS[i]["name"]) for i, n in RECIPES[k]["needs"].items())
+            else:
+                u = UPGRADES[k]
+                icon, name, sub = u["icon"], u["name"], u["desc"]
+            price = self.pc_price(tab, k)
+            self.icon(icon, (rr.x + 10, rr.y + 7), 2)
+            self.text(name, (rr.x + 54, rr.y + 4), self.f_m, TEXT)
+            self.text(sub, (rr.x + 54, rr.y + 28), self.f_s, PANEL_D)
+            self.text("%dg" % price, (rr.right - 14, rr.y + 12), self.f_m, TEXT if self.money >= price else (170, 50, 40), right=True)
+
+        self.draw_rows(r, r.y + 126, entries, m, 6, row)
+        n_mail = sum(self.pending.values())
+        self.text("In the mail: %d item%s" % (n_mail, "" if n_mail == 1 else "s"), (r.x + 20, r.bottom - 34), self.f_s, (60, 80, 120))
+        hint = "Left/Right: tab   Enter: sell or buy 1   Shift+Enter: x5   Esc: close"
+        self.text(hint, (r.right - 20, r.bottom - 34), self.f_s, (60, 80, 120), right=True)
+
+    # ------------------------------------------------------- cafe menu
+    def draw_cafe_menu(self):
+        m = self.menu
+        r = pygame.Rect(WIN_W // 2 - 330, WIN_H // 2 - 250, 660, 500)
+        self.panel(r)
+        self.text("Your Cafe", (r.x + 24, r.y + 18), self.f_l, TEXT)
+        st = self.stars()
+        for i in range(5):
+            draw_star(self.screen, r.right - 150 + i * 26, r.y + 34, 11, GOLD if i < st else (190, 150, 100))
+        cs = self.cafe_stats
+        self.text("Today: %d served, %dg earned (tips %dg), %d unhappy" % (cs["served"], cs["earned"], cs["tips"], cs["angry"]),
+                  (r.x + 24, r.y + 56), self.f_s, PANEL_D)
+        entries = ["__open__"] + list(self.unlocked)
+
+        def row(k, rr):
+            if k == "__open__":
+                self.icon("coin", (rr.x + 10, rr.y + 7), 2)
+                self.text("Cafe is %s" % ("OPEN" if self.cafe_open else "CLOSED"), (rr.x + 54, rr.y + 4), self.f_m, TEXT)
+                self.text("Guests arrive 9am-9pm. Enter to toggle.", (rr.x + 54, rr.y + 28), self.f_s, PANEL_D)
+            else:
+                on = self.menu_on.get(k, True)
+                self.icon(k, (rr.x + 10, rr.y + 7), 2)
+                self.text(RECIPES[k]["name"], (rr.x + 54, rr.y + 4), self.f_m, TEXT)
+                self.text("Guests pay %dg. You have %d." % (self.cafe_price(k), self.inv.get(k, 0)), (rr.x + 54, rr.y + 28), self.f_s, PANEL_D)
+                self.text("ON" if on else "OFF", (rr.right - 14, rr.y + 12), self.f_m, (50, 120, 50) if on else (170, 50, 40), right=True)
+
+        self.draw_rows(r, r.y + 84, entries, m, 7, row)
+        self.text("Enter: toggle menu item   Esc: close", (r.centerx, r.bottom - 26), self.f_s, PANEL_D, center=True)
+
+    # ------------------------------------------------------- arcade menu
+    def draw_arcade_menu(self):
+        m = self.menu
+        r = pygame.Rect(WIN_W // 2 - 330, WIN_H // 2 - 250, 660, 500)
+        self.panel(r)
+        self.text("Arcade", (r.x + 24, r.y + 18), self.f_l, TEXT)
+        self.icon("ticket", (r.right - 190, r.y + 16), 2)
+        self.text("x%d" % self.inv.get("ticket", 0), (r.right - 150, r.y + 24), self.f_m, TEXT)
+        self.icon("coin", (r.right - 100, r.y + 16), 2)
+        self.text("%dg" % self.money, (r.right - 62, r.y + 24), self.f_s, TEXT)
+        self.text("Each game costs %dg. Score earns tickets and gold." % PLAY_COST, (r.x + 24, r.y + 56), self.f_s, PANEL_D)
+        entries = list(MINI) + list(PRIZES)
+
+        def row(k, rr):
+            if k in MINI:
+                g = MINI[k]
+                self.icon(g["icon"], (rr.x + 10, rr.y + 7), 2)
+                self.text(g["name"], (rr.x + 54, rr.y + 4), self.f_m, TEXT)
+                self.text(g["desc"], (rr.x + 54, rr.y + 28), self.f_s, PANEL_D)
+                self.text("Best %d" % self.hi.get(k, 0), (rr.right - 14, rr.y + 14), self.f_s, TEXT, right=True)
+            else:
+                p = PRIZES[k]
+                self.icon(p["icon"], (rr.x + 10, rr.y + 7), 2)
+                self.text(p["name"], (rr.x + 54, rr.y + 4), self.f_m, TEXT)
+                self.text(p["desc"], (rr.x + 54, rr.y + 28), self.f_s, PANEL_D)
+                ok = self.inv.get("ticket", 0) >= p["cost"]
+                self.text("%d tickets" % p["cost"], (rr.right - 14, rr.y + 14), self.f_s, TEXT if ok else (170, 50, 40), right=True)
+
+        self.draw_rows(r, r.y + 84, entries, m, 7, row)
+        self.text("Enter: play / claim prize   Esc: leave", (r.centerx, r.bottom - 26), self.f_s, PANEL_D, center=True)
+
+    def extra_menu_key(self, ev, ty):
+        m = self.menu
+        k = ev.key
+        if ty == "journal":
+            if k == pygame.K_UP:
+                m["idx"] = max(0, m["idx"] - 1)
+            elif k == pygame.K_DOWN:
+                m["idx"] = min(len(FISH) - 1, m["idx"] + 1)
+            elif k == pygame.K_ESCAPE:
+                self.state, self.menu = "play", {}
+            return
+        if ty == "fishmaster":
+            if k == pygame.K_ESCAPE and m.get("view") != "journal":
+                self.state, self.menu = "play", {}
+            else:
+                self.fishmaster_key(ev)
+            return
+        if ty == "admin":
+            if k == pygame.K_ESCAPE:
+                self.state, self.menu = "play", {}
+            else:
+                self.admin_key(ev)
+            return
+        up = k in (pygame.K_UP, pygame.K_w)
+        down = k in (pygame.K_DOWN, pygame.K_s)
+        left = k in (pygame.K_LEFT, pygame.K_a)
+        right = k in (pygame.K_RIGHT, pygame.K_d)
+        ok = k in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_KP_ENTER)
+        shift = ev.mod & pygame.KMOD_SHIFT
+        if k == pygame.K_ESCAPE:
+            self.state, self.menu = "play", {}
+            return
+        if ty == "pc":
+            if left or right:
+                m["tab"] = (m["tab"] + (1 if right else -1)) % 5
+                m["idx"], m["scroll"] = 0, 0
+                return
+            entries = self.pc_entries(m["tab"])
+        elif ty == "cafe":
+            entries = ["__open__"] + list(self.unlocked)
+        elif ty == "bench":
+            entries = list(WORKBENCH)
+        else:
+            entries = list(MINI) + list(PRIZES)
+        if up:
+            m["idx"] = max(0, m["idx"] - 1)
+        elif down:
+            m["idx"] = min(max(0, len(entries) - 1), m["idx"] + 1)
+        elif ok and entries:
+            key = entries[clamp(m["idx"], 0, len(entries) - 1)]
+            if ty == "pc" and m["tab"] == 4:
+                self.trade(key[0], key[1], 5 if shift else 1)
+                m["idx"] = clamp(m["idx"], 0, max(0, len(self.pc_entries(4)) - 1))
+            elif ty == "pc":
+                self.pc_buy(m["tab"], key, 5 if (shift and m["tab"] in (0, 1)) else 1)
+                m["idx"] = clamp(m["idx"], 0, max(0, len(self.pc_entries(m["tab"])) - 1))
+            elif ty == "bench":
+                self.bench_craft(key)
+            elif ty == "cafe":
+                if key == "__open__":
+                    self.cafe_open = not self.cafe_open
+                else:
+                    self.menu_on[key] = not self.menu_on.get(key, True)
+            elif key in MINI:
+                self.start_mini(key)
+            else:
+                self.claim_prize(key)
+
+    def claim_prize(self, k):
+        p = PRIZES[k]
+        if self.inv.get("ticket", 0) < p["cost"]:
+            self.toast("Not enough tickets.")
+            return
+        if k == "p_trophy" and "trophy" in self.owned:
+            self.toast("You already own the trophy!")
+            return
+        self.take_item("ticket", p["cost"])
+        if k == "p_seeds":
+            for _ in range(3):
+                self.add_item(random.choice(list(CROPS)) + "_seed", 1)
+        elif k == "p_bar":
+            self.add_item("energy_bar")
+        else:
+            self.owned.add("trophy")
+            self.rep = clamp(self.rep + 15, 0, 100)
+            self.toast("You won the Golden Fork Trophy!", "coin")
+
+    # ------------------------------------------------------- mini-games
+    def start_mini(self, kind):
+        if self.money < PLAY_COST:
+            self.toast("You need %dg to play." % PLAY_COST)
+            return
+        self.money -= PLAY_COST
+        if kind in HISTORY_GAMES:
+            return self.history_start(kind)
+        m = dict(kind=kind, t=0.0, score=0, lives=3, fx=[])
+        if kind == "veggie":
+            m.update(time=60.0, bx=450.0, items=[], spawn=0.5)
+        elif kind == "weed":
+            m.update(time=45.0, holes=[None] * 9, spawn=0.6, cur=4, combo=0)
+        else:
+            m.update(seq=[], show_t=-0.6, phase="show", pt=0.0, inp=0, flash=None, lives=1)
+            self.memory_next_round(m)
+        self.mini = m
+        self.menu = {}
+        self.state = "mini"
+
+    def memory_next_round(self, m):
+        m["seq"].append(random.randrange(4))
+        m["phase"], m["show_t"], m["inp"], m["flash"] = "show", -0.6, 0, None
+
+    def pop_fx(self, x, y, text, col=(255, 240, 150)):
+        self.mini["fx"].append(dict(x=x, y=y, t=0.7, s=text, c=col))
+
+    def weed_rect(self, i):
+        return pygame.Rect(450 + (i % 3 - 1) * 200 - 80, 150 + (i // 3) * 135, 160, 100)
+
+    def whack(self, i):
+        m = self.mini
+        h = m["holes"][i]
+        if not h:
+            return
+        rr = self.weed_rect(i)
+        if h["k"] == "weed":
+            pts = 10 + m["combo"] * 2
+            m["score"] += pts
+            m["combo"] += 1
+            self.pop_fx(rr.centerx, rr.y, "+%d" % pts)
+        else:
+            m["lives"] -= 1
+            m["combo"] = 0
+            self.pop_fx(rr.centerx, rr.y, "Oops!", (255, 120, 120))
+        m["holes"][i] = None
+
+    def memory_press(self, d):
+        m = self.mini
+        if m["phase"] != "input":
+            return
+        m["flash"] = dict(d=d, t=0.25)
+        if d == m["seq"][m["inp"]]:
+            m["inp"] += 1
+            if m["inp"] >= len(m["seq"]):
+                m["score"] += 10 * len(m["seq"])
+                m["phase"], m["pt"] = "next", 0.7
+        else:
+            m["phase"], m["pt"] = "wrong", 1.0
+
+    def mini_tap(self, x, y):
+        m = self.mini
+        if m and m["kind"] in HISTORY_GAMES:
+            return self.history_tap(x, y)
+        if self.state != "mini" or not m:
+            return
+        if m["kind"] == "weed":
+            for i in range(9):
+                if self.weed_rect(i).inflate(20, 40).collidepoint(x, y):
+                    self.whack(i)
+                    return
+        elif m["kind"] == "memory":
+            for d, c in enumerate(MEM_CENTERS):
+                if abs(x - c[0]) < 70 and abs(y - c[1]) < 70:
+                    self.memory_press(d)
+                    return
+
+    def mini_key(self, ev):
+        m = self.mini
+        if m["kind"] in HISTORY_GAMES:
+            return self.history_key(ev)
+        k = ev.key
+        if k == pygame.K_ESCAPE:
+            self.end_mini()
+            return
+        dirs = {pygame.K_UP: 0, pygame.K_w: 0, pygame.K_RIGHT: 1, pygame.K_d: 1,
+                pygame.K_DOWN: 2, pygame.K_s: 2, pygame.K_LEFT: 3, pygame.K_a: 3}
+        if m["kind"] == "memory":
+            if k in dirs:
+                self.memory_press(dirs[k])
+        elif m["kind"] == "weed":
+            if k in dirs:
+                d, c = dirs[k], m["cur"]
+                if d == 0:
+                    c = (c - 3) % 9
+                elif d == 2:
+                    c = (c + 3) % 9
+                elif d == 1:
+                    c = c - c % 3 + (c % 3 + 1) % 3
+                else:
+                    c = c - c % 3 + (c % 3 - 1) % 3
+                m["cur"] = c
+            elif k in (pygame.K_SPACE, pygame.K_RETURN, pygame.K_KP_ENTER):
+                self.whack(m["cur"])
+
+    def update_mini(self, dt):
+        if self.mini["kind"] in HISTORY_GAMES:
+            return self.history_update(dt)
+        m = self.mini
+        m["t"] += dt
+        for f in m["fx"]:
+            f["t"] -= dt
+        m["fx"] = [f for f in m["fx"] if f["t"] > 0]
+        kind = m["kind"]
+        if kind == "veggie":
+            m["time"] -= dt
+            keys = pygame.key.get_pressed()
+            dx = int(keys[pygame.K_d] or keys[pygame.K_RIGHT]) - int(keys[pygame.K_a] or keys[pygame.K_LEFT])
+            v = dx if dx else self.touch.vec[0]
+            m["bx"] = clamp(m["bx"] + v * 470 * dt, 170, 730)
+            m["spawn"] -= dt
+            if m["spawn"] <= 0:
+                m["spawn"] = max(0.28, 0.6 - m["t"] * 0.006)
+                r = random.random()
+                k = "rock" if r < 0.22 else ("gold" if r < 0.28 else "veg")
+                m["items"].append(dict(x=random.uniform(150, 750), y=100, k=k, v=random.choice(list(CROPS)),
+                                       vy=170 + m["t"] * 4 + random.uniform(0, 40)))
+            for it in m["items"][:]:
+                it["y"] += it["vy"] * dt
+                if abs(it["x"] - m["bx"]) < 56 and 480 < it["y"] < 520:
+                    m["items"].remove(it)
+                    if it["k"] == "rock":
+                        m["lives"] -= 1
+                        self.pop_fx(it["x"], 470, "Ouch!", (255, 120, 120))
+                    else:
+                        pts = 50 if it["k"] == "gold" else 10
+                        m["score"] += pts
+                        self.pop_fx(it["x"], 470, "+%d" % pts)
+                elif it["y"] > 560:
+                    m["items"].remove(it)
+            if m["lives"] <= 0 or m["time"] <= 0:
+                self.end_mini()
+        elif kind == "weed":
+            m["time"] -= dt
+            for i, h in enumerate(m["holes"]):
+                if h:
+                    h["age"] += dt
+                    if h["age"] > h["life"]:
+                        if h["k"] == "weed":
+                            m["combo"] = 0
+                        m["holes"][i] = None
+            m["spawn"] -= dt
+            if m["spawn"] <= 0:
+                m["spawn"] = max(0.35, 0.8 - m["t"] * 0.01)
+                free = [i for i, h in enumerate(m["holes"]) if h is None]
+                if free:
+                    m["holes"][random.choice(free)] = dict(
+                        k="weed" if random.random() < 0.75 else "flower", age=0.0,
+                        life=max(0.7, random.uniform(1.0, 1.6) - m["t"] * 0.01))
+            if m["lives"] <= 0 or m["time"] <= 0:
+                self.end_mini()
+        else:
+            if m["phase"] == "show":
+                m["show_t"] += dt
+                if m["show_t"] >= len(m["seq"]) * 0.7:
+                    m["phase"], m["inp"] = "input", 0
+            if m["flash"]:
+                m["flash"]["t"] -= dt
+                if m["flash"]["t"] <= 0:
+                    m["flash"] = None
+            if m["phase"] == "wrong":
+                m["pt"] -= dt
+                if m["pt"] <= 0:
+                    self.end_mini()
+            elif m["phase"] == "next":
+                m["pt"] -= dt
+                if m["pt"] <= 0:
+                    self.memory_next_round(m)
+
+    def end_mini(self):
+        m = self.mini
+        score = m["score"]
+        per = {"veggie": 30, "weed": 25, "memory": 20, "pyramid": 2, "quiz": 10, "caravan": 15}[m["kind"]]
+        tickets, gold = score // per, score // 2
+        self.money += gold
+        if tickets:
+            self.add_item("ticket", tickets, quiet=True)
+        new = score > self.hi.get(m["kind"], 0)
+        if new:
+            self.hi[m["kind"]] = score
+        self.mini_result = dict(kind=m["kind"], score=score, tickets=tickets, gold=gold, new=new)
+        self.state = "mini_over"
+
+    def draw_mini(self):
+        scr = self.screen
+        if self.state == "mini" and self.mini["kind"] in HISTORY_GAMES:
+            return self.history_draw()
+        scr.fill((18, 14, 36))
+        for i in range(0, WIN_W, 40):
+            pygame.draw.line(scr, (34, 28, 66), (i, 0), (i, WIN_H))
+        for j in range(0, WIN_H, 40):
+            pygame.draw.line(scr, (34, 28, 66), (0, j), (WIN_W, j))
+        if self.state == "mini_over":
+            self.draw_mini_over()
+            return
+        m = self.mini
+        area = pygame.Rect(110, 70, 680, 500)
+        pygame.draw.rect(scr, (30, 22, 60), area, border_radius=10)
+        pygame.draw.rect(scr, (250, 80, 140), area, 4, border_radius=10)
+        self.text(MINI[m["kind"]]["name"], (area.centerx, 78), self.f_l, (255, 230, 120), shadow=(120, 30, 70), center=True)
+        self.text("Score %d" % m["score"], (area.x + 18, 90), self.f_m, (255, 255, 255))
+        if "time" in m:
+            self.text("Time %d" % max(0, int(m["time"])), (area.right - 18, 90), self.f_m, (255, 255, 255), right=True)
+        if m["kind"] != "memory":
+            for i in range(m["lives"]):
+                draw_heart(scr, area.x + 30 + i * 28, 126, 9, (240, 90, 120))
+        kind = m["kind"]
+        if kind == "veggie":
+            for it in m["items"]:
+                x, y = int(it["x"]), int(it["y"])
+                if it["k"] == "rock":
+                    self.icon("stone", (x - 24, y - 24), 3)
+                else:
+                    if it["k"] == "gold":
+                        pygame.draw.circle(scr, (250, 210, 70), (x, y), 30)
+                        pygame.draw.circle(scr, (255, 244, 170), (x, y), 30, 3)
+                    self.icon(it["v"], (x - 24, y - 24), 3)
+            bx, by = int(m["bx"]), 500
+            pts = [(bx - 52, by), (bx + 52, by), (bx + 40, by + 34), (bx - 40, by + 34)]
+            pygame.draw.polygon(scr, (176, 126, 80), pts)
+            pygame.draw.polygon(scr, (96, 64, 40), pts, 3)
+            for k in (-26, 0, 26):
+                pygame.draw.line(scr, (120, 84, 54), (bx + k, by + 4), (bx + int(k * 0.8), by + 30), 2)
+            self.text("Move: A / D or arrows (touch: drag left side)", (area.centerx, area.bottom - 26), self.f_s, (200, 190, 240), center=True)
+        elif kind == "weed":
+            for i in range(9):
+                rr = self.weed_rect(i)
+                pygame.draw.ellipse(scr, (50, 34, 28), (rr.x, rr.bottom - 44, rr.w, 44))
+                h = m["holes"][i]
+                if h:
+                    rise = min(1.0, h["age"] / 0.18)
+                    left = h["life"] - h["age"]
+                    if left < 0.2:
+                        rise *= max(0.0, left / 0.2)
+                    cx, cy = rr.centerx, rr.bottom - 26 - int(52 * rise)
+                    if h["k"] == "weed":
+                        pygame.draw.circle(scr, (90, 170, 70), (cx, cy), 28)
+                        for a in (-40, 0, 40):
+                            pygame.draw.line(scr, (60, 130, 50), (cx + a // 2, cy - 22), (cx + a, cy - 44), 5)
+                        pygame.draw.circle(scr, (255, 255, 255), (cx - 10, cy - 4), 6)
+                        pygame.draw.circle(scr, (255, 255, 255), (cx + 10, cy - 4), 6)
+                        pygame.draw.circle(scr, (30, 30, 40), (cx - 10, cy - 4), 3)
+                        pygame.draw.circle(scr, (30, 30, 40), (cx + 10, cy - 4), 3)
+                    else:
+                        for dx, dy in ((0, -16), (-16, 0), (16, 0), (0, 16)):
+                            pygame.draw.circle(scr, (248, 176, 200), (cx + dx, cy + dy), 14)
+                        pygame.draw.circle(scr, (250, 220, 90), (cx, cy), 10)
+                pygame.draw.ellipse(scr, (96, 68, 48), (rr.x, rr.bottom - 44, rr.w, 44), 5)
+            rr = self.weed_rect(m["cur"])
+            pygame.draw.rect(scr, (255, 230, 120), rr, 3, border_radius=8)
+            self.text("Arrows + Space, or just tap the weeds!", (area.centerx, area.bottom - 26), self.f_s, (200, 190, 240), center=True)
+        else:
+            lit = None
+            if m["phase"] == "show" and m["show_t"] >= 0:
+                idx = int(m["show_t"] / 0.7)
+                if idx < len(m["seq"]) and (m["show_t"] % 0.7) < 0.45:
+                    lit = m["seq"][idx]
+            if m["flash"]:
+                lit = m["flash"]["d"]
+            for d in range(4):
+                c = MEM_CENTERS[d]
+                rr = pygame.Rect(0, 0, 124, 124)
+                rr.center = c
+                base = MEM_COLS[d]
+                col = base if lit == d else tuple(int(v * 0.35) for v in base)
+                pygame.draw.rect(scr, col, rr, border_radius=16)
+                pygame.draw.rect(scr, (255, 255, 255) if lit == d else (90, 80, 110), rr, 4, border_radius=16)
+                self.icon(MEM_ICONS[d], (c[0] - 40, c[1] - 40), 5)
+            status = {"show": "Watch carefully...", "input": "Your turn!  %d / %d" % (m["inp"], len(m["seq"])),
+                      "next": "Nice!", "wrong": "Wrong order!"}[m["phase"]]
+            self.text(status, (area.centerx, 122), self.f_m, (255, 255, 255), center=True)
+            self.text("Arrows / WASD, or tap the ingredients", (area.centerx, area.bottom - 26), self.f_s, (200, 190, 240), center=True)
+        for f in m["fx"]:
+            self.text(f["s"], (f["x"], f["y"] - (0.7 - f["t"]) * 60), self.f_m, f["c"], shadow=INK, center=True)
+
+    def draw_mini_over(self):
+        res = self.mini_result
+        r = pygame.Rect(WIN_W // 2 - 260, 120, 520, 400)
+        self.panel(r)
+        self.text(MINI[res["kind"]]["name"], (r.centerx, r.y + 22), self.f_l, TEXT, center=True)
+        self.text("Game over!", (r.centerx, r.y + 70), self.f_m, (150, 70, 40), center=True)
+        self.text("Score: %d" % res["score"], (r.centerx, r.y + 120), self.f_l, TEXT, center=True)
+        if res["new"]:
+            self.text("New high score!", (r.centerx, r.y + 160), self.f_m, (60, 120, 50), center=True)
+        self.icon("ticket", (r.centerx - 90, r.y + 200), 2)
+        self.text("+%d tickets" % res["tickets"], (r.centerx - 50, r.y + 208), self.f_m, TEXT)
+        self.icon("coin", (r.centerx - 90, r.y + 250), 2)
+        self.text("+%dg" % res["gold"], (r.centerx - 50, r.y + 258), self.f_m, TEXT)
+        self.text("Press Enter", (r.centerx, r.bottom - 36), self.f_s, PANEL_D, center=True)
+
+    # ------------------------------------------------------- fishing
+    def start_fishing(self, tx, ty):
+        self.fishing = dict(tx=tx, ty=ty, phase="charge", power=0.0, dir=1, charging=False,
+                            t=0.0, bite=0.0, perfect=False, holding=False, kind="fish")
+        self.state = "fishing"
+
+    def end_fishing(self):
+        self.fishing = None
+        self.state = "play"
+
+    def fishing_down(self):
+        """Action pressed: charge a cast, hook a bite, or lift the reel bar."""
+        f = self.fishing
+        if not f:
+            return
+        f["holding"] = True
+        if f["phase"] == "charge":
+            f["charging"] = True
+        elif f["phase"] == "wait":
+            self.toast("Too early! The fish got scared.")
+            self.end_fishing()
+        elif f["phase"] == "bite":
+            kind = roll_fish(self.level("fish"), f["perfect"], "hook" in self.owned or self.location in ("island", "station"),
+                             "master" in self.owned)
+            tier = FISH[kind]["tier"]
+            f.update(phase="reel", kind=kind, zh=max(0.16, 0.34 - 0.04 * tier),
+                     speed=0.9 + 0.3 * tier + 0.05 * self.level("fish"),
+                     fy=0.5, ftgt=0.5, ft=0.0, zy=0.5, zv=0.0, prog=0.35)
+
+    def fishmaster_entries(self):
+        n, title, bonus = self.fish_mastery()
+        ents = [("sell", "Sell all my fish (+%d%% rank bonus)" % int(bonus * 100)),
+                ("rank", "Your rank: %s (%d of %d species)" % (title, n, len(FISH)))]
+        if "master" in self.owned:
+            ents.append(("done", "You already own the Master Rod"))
+        elif n == len(FISH):
+            ents.append(("rod", "Claim the Master Rod!"))
+        else:
+            ents.append(("locked", "Master Rod: catch all %d species" % len(FISH)))
+        return ents
+
+    def fishmaster_act(self, key):
+        if key == "sell":
+            _, _, bonus = self.fish_mastery()
+            base = sum(FISH[k]["sell"] * self.inv.get(k, 0) for k in FISH)
+            if base == 0:
+                self.toast("You have no fish to sell.")
+                return
+            for k in FISH:
+                if self.inv.get(k):
+                    self.take_item(k, self.inv[k])
+            total = int(base * (1 + bonus))
+            self.money += total
+            self.toast("The Fish Master paid you %dg" % total, "coin")
+        elif key == "rod":
+            self.owned.add("master")
+            self.toast("You earned the Master Rod! Rare fish bite more often now.")
+
+    def draw_fishmaster(self):
+        m = self.menu
+        r = pygame.Rect(WIN_W // 2 - 300, WIN_H // 2 - 200, 600, 400)
+        self.panel(r)
+        self.text("The Fish Master", (r.centerx, r.y + 18), self.f_l, TEXT, center=True)
+        if m.get("view") == "journal":
+            self.draw_journal()
+            return
+        for i, (key, label) in enumerate(self.fishmaster_entries()):
+            rr = pygame.Rect(r.x + 30, r.y + 80 + i * 44, r.w - 60, 36)
+            if m["idx"] == i:
+                pygame.draw.rect(self.screen, GOLD, rr, border_radius=6)
+            col = TEXT if key not in ("locked", "done") else PANEL_D
+            self.text(label, rr.center, self.f_m, col, center=True)
+        self.text("Enter: choose     Esc: leave", (r.centerx, r.bottom - 26), self.f_s, PANEL_D, center=True)
+
+    def fishmaster_key(self, ev):
+        m = self.menu
+        k = ev.key
+        if m.get("view") == "journal":
+            if k in (pygame.K_ESCAPE, pygame.K_RETURN, pygame.K_BACKSPACE):
+                m["view"] = "list"
+            return
+        ents = self.fishmaster_entries()
+        if k in (pygame.K_UP, pygame.K_w):
+            m["idx"] = max(0, m["idx"] - 1)
+        elif k in (pygame.K_DOWN, pygame.K_s):
+            m["idx"] = min(len(ents) - 1, m["idx"] + 1)
+        elif k in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_KP_ENTER):
+            key = ents[clamp(m["idx"], 0, len(ents) - 1)][0]
+            if key == "rank":
+                m["view"] = "journal"
+            else:
+                self.fishmaster_act(key)
+
+    def fish_mastery(self):
+        """(species caught, rank title, sell bonus) from the fish journal."""
+        n = sum(1 for k in FISH if self.fish_log.get(k, 0) > 0)
+        title, bonus = "No rank yet", 0.0
+        for need, name, b in MASTERY:
+            if n >= need:
+                title, bonus = name, b
+        return n, title, bonus
+
+    def fishing_up(self):
+        """Action released: a charging cast is thrown; while reeling, the bar falls."""
+        f = self.fishing
+        if not f:
+            return
+        f["holding"] = False
+        if f["phase"] == "charge" and f["charging"]:
+            f["charging"] = False
+            f["perfect"] = 0.4 <= f["power"] <= 0.6
+            f["phase"] = "wait"
+            f["t"] = random.uniform(2.0, 4.5) - (0.8 if f["perfect"] else 0.0)
+            if f["power"] < 0.15:
+                f["t"] += 2.0
+
+    def update_fishing(self, dt):
+        f = self.fishing
+        if not f:
+            return
+        ph = f["phase"]
+        if ph == "charge":
+            if f["charging"]:
+                f["power"] += f["dir"] * dt * 1.5
+                if f["power"] >= 1.0:
+                    f["power"], f["dir"] = 1.0, -1
+                elif f["power"] <= 0.0:
+                    f["power"], f["dir"] = 0.0, 1
+        elif ph == "wait":
+            f["t"] -= dt
+            if f["t"] <= 0:
+                f["phase"] = "bite"
+                f["bite"] = 0.85 + 0.04 * self.level("fish")
+        elif ph == "bite":
+            f["bite"] -= dt
+            if f["bite"] <= 0:
+                self.toast("It got away...")
+                self.end_fishing()
+        elif ph == "reel":
+            self.update_reel(f, dt)
+
+    def update_reel(self, f, dt):
+        zh = f["zh"]
+        accel = 2.6 if f["holding"] else -1.9
+        f["zv"] = (f["zv"] + accel * dt) * (0.94 ** (dt * 60))
+        f["zy"] += f["zv"] * dt
+        lo, hi = zh / 2, 1 - zh / 2
+        if f["zy"] < lo:
+            f["zy"], f["zv"] = lo, 0.0
+        if f["zy"] > hi:
+            f["zy"], f["zv"] = hi, 0.0
+        f["ft"] -= dt
+        if f["ft"] <= 0:
+            f["ftgt"] = random.uniform(0.08, 0.92)
+            f["ft"] = random.uniform(0.5, 1.2)
+        f["fy"] += (f["ftgt"] - f["fy"]) * min(1.0, dt * f["speed"] * 1.5)
+        inside = abs(f["fy"] - f["zy"]) < zh / 2
+        f["prog"] = clamp(f["prog"] + dt * (0.32 if inside else -0.22), 0.0, 1.0)
+        if f["prog"] >= 1.0:
+            self.add_item(f["kind"])
+            self.qinc("fish")
+            first = self.fish_log.get(f["kind"], 0) == 0
+            self.fish_log[f["kind"]] = self.fish_log.get(f["kind"], 0) + 1
+            if first:
+                self.toast("New journal entry: %s!" % FISH[f["kind"]]["name"], f["kind"])
+            self.gain_xp("fish", 8 + 6 * FISH[f["kind"]]["tier"])
+            self.sparkle(f["tx"] * TILE + 8, f["ty"] * TILE + 4, 10)
+            self.end_fishing()
+        elif f["prog"] <= 0.0:
+            self.toast("The fish got away!")
+            self.end_fishing()
+
+    def draw_fishing(self):
+        f = self.fishing
+        if not f:
+            return
+        cx, cy = self.camera()
+        scr = self.screen
+        ph = f["phase"]
+        p = self.player
+        px, py = (p.x - cx) * SCALE, (p.y - 14 - cy) * SCALE
+        bx = (f["tx"] * TILE + 8 - cx) * SCALE
+        by = (f["ty"] * TILE + 8 - cy) * SCALE
+        if ph in ("wait", "bite", "reel"):
+            bob = math.sin(self.t * 5) * 3
+            if ph == "bite":
+                bob += 10 if int(self.t * 12) % 2 == 0 else 0
+            pygame.draw.line(scr, (240, 240, 245), (px, py), (bx, by + bob), 2)
+            for i in range(2):
+                rad = int(10 + ((self.t * 20 + i * 12) % 24))
+                pygame.draw.circle(scr, (210, 236, 250), (int(bx), int(by + 6)), rad, 1)
+            pygame.draw.circle(scr, (240, 70, 60), (int(bx), int(by + bob)), 8)
+            pygame.draw.circle(scr, (255, 255, 255), (int(bx), int(by + bob - 3)), 4)
+        if ph == "charge":
+            bw, x0, y0 = 340, WIN_W // 2 - 170, WIN_H - 120
+            pygame.draw.rect(scr, INK, (x0 - 4, y0 - 4, bw + 8, 30), border_radius=8)
+            pygame.draw.rect(scr, (60, 52, 50), (x0, y0, bw, 22), border_radius=6)
+            pygame.draw.rect(scr, (120, 200, 110), (x0 + int(bw * 0.4), y0, int(bw * 0.2), 22), border_radius=6)
+            pygame.draw.rect(scr, (250, 200, 60), (x0, y0, int(bw * f["power"]), 22), border_radius=6)
+            pygame.draw.rect(scr, (255, 255, 255), (x0 + int(bw * f["power"]) - 2, y0 - 4, 4, 30))
+            self.text("Hold SPACE to charge. Release to cast. Green = perfect!", (WIN_W // 2, y0 - 24),
+                      self.f_s, CREAM, shadow=INK, center=True)
+        elif ph == "wait":
+            self.text("Wait for a bite...", (px, py - 76), self.f_m, CREAM, shadow=INK, center=True)
+        elif ph == "bite":
+            pygame.draw.circle(scr, (255, 220, 80), (int(px), int(py - 70)), 26)
+            pygame.draw.circle(scr, INK, (int(px), int(py - 70)), 26, 3)
+            self.text("!", (px, py - 92), self.f_xl, (200, 40, 30), center=True)
+            self.text("PRESS SPACE!", (WIN_W // 2, 60), self.f_l, (255, 230, 120), shadow=INK, center=True)
+        elif ph == "reel":
+            x0, y0, h = WIN_W - 150, 110, 400
+            pygame.draw.rect(scr, INK, (x0 - 6, y0 - 6, 72, h + 12), border_radius=10)
+            pygame.draw.rect(scr, (40, 36, 44), (x0, y0, 60, h), border_radius=8)
+            zh_px = int(f["zh"] * h)
+            zc = y0 + int((1 - f["zy"]) * h)
+            pygame.draw.rect(scr, (110, 220, 100), (x0 + 4, zc - zh_px // 2, 52, zh_px), border_radius=6)
+            fy = y0 + int((1 - f["fy"]) * h)
+            col = FISH[f["kind"]]["color"]
+            pygame.draw.circle(scr, col, (x0 + 30, fy), 10)
+            pygame.draw.circle(scr, INK, (x0 + 30, fy), 10, 2)
+            pygame.draw.rect(scr, INK, (x0 - 30, y0 - 6, 18, h + 12), border_radius=6)
+            pygame.draw.rect(scr, (60, 52, 50), (x0 - 26, y0, 10, h), border_radius=4)
+            pygame.draw.rect(scr, (120, 220, 120), (x0 - 26, y0 + int((1 - f["prog"]) * h), 10, int(f["prog"] * h)), border_radius=4)
+            self.text("Hold SPACE to lift the bar. Keep the fish in the green!", (WIN_W // 2, 60),
+                      self.f_m, CREAM, shadow=INK, center=True)
+
 # ============================================================ the game
-class Game:
+def make_app_icon(size=32):
+    """Small pot-and-carrot icon drawn in code (used for the window icon)."""
+    s = pygame.Surface((size, size), pygame.SRCALPHA)
+    k = size / 32.0
+    def R(c, x, y, w, h, r=0):
+        pygame.draw.rect(s, c, (int(x * k), int(y * k), int(w * k), int(h * k)), border_radius=int(r * k))
+    R((120, 170, 90), 0, 0, 32, 32, 7)
+    R((250, 150, 60), 14, 14, 5, 12, 2)
+    pygame.draw.polygon(s, (90, 160, 70), [(int(16 * k), int(14 * k)), (int(10 * k), int(6 * k)), (int(22 * k), int(6 * k))])
+    R((70, 62, 60), 6, 16, 20, 11, 4)
+    R((96, 88, 84), 8, 14, 16, 4, 2)
+    R((240, 240, 236), 9, 6, 2, 6, 1)
+    R((240, 240, 236), 13, 4, 2, 6, 1)
+    return s
+
+
+class Game(Extras):
     def __init__(self):
         pygame.display.set_caption("A Game About Farming and Cooking")
-        self.screen = pygame.display.set_mode((WIN_W, WIN_H))
+        pygame.display.set_icon(make_app_icon())
+        pygame.display.set_caption("A Game About Farming and Cooking" + ("" if CAN_HOST else " - Player"))
+        if ANDROID:
+            pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        else:
+            pygame.display.set_mode((WIN_W, WIN_H), pygame.RESIZABLE)
+        self.screen = pygame.Surface((WIN_W, WIN_H))
+        self.hotbar_rects = []
+        self.disp_size = (WIN_W, WIN_H)
+        self.dst = pygame.Rect(0, 0, WIN_W, WIN_H)
+        self.dscale = 1.0
+        self.layout_display()
+        self.touch = TouchControls(self)
         self.view = pygame.Surface((VIEW_W, VIEW_H))
         self.clock = pygame.time.Clock()
-        # Android touch state: directional keys are held while the virtual stick is held.
-        self.touch_keys = set()
-        self.joystick_finger = None
-        self.joystick_vector = (0, 0)
-        self.touch_buttons = {}
-        self.last_touch_time = 0
         self.f_s = pygame.font.Font(None, 22)
         self.f_m = pygame.font.Font(None, 28)
         self.f_l = pygame.font.Font(None, 40)
         self.f_xl = pygame.font.Font(None, 76)
         build_static_sprites()
-        self.icons = {k: make_icon(k) for k in ITEMS}
+        build_extra_sprites()
+        self.icons = {k: tex(k) or make_icon(k) for k in ITEMS}
         self.icons["coin"] = make_icon("coin")
         self.icons2 = {}
         self.season_built = None
@@ -790,6 +3771,283 @@ class Game:
         self.state = "title"
 
     # ------------------------------------------------------- setup
+    # ------------------------------------------------------- quests
+    def qinc(self, stat, n=1):
+        self.qstats[stat] = self.qstats.get(stat, 0) + n
+
+    def quest_progress(self, q, base=0):
+        g = q["goal"]
+        t = g[0]
+        if t == "stat":
+            return min(self.qstats.get(g[1], 0) - base, g[2]), g[2]
+        if t == "items":
+            need = sum(g[1].values())
+            have = sum(min(self.inv.get(i, 0), n) for i, n in g[1].items())
+            return have, need
+        if t == "money":
+            return min(self.money, g[1]), g[1]
+        if t == "level":
+            return min(self.level(g[1]), g[2]), g[2]
+        if t == "fishkinds":
+            kinds = sum(1 for v in self.fish_log.values() if v > 0)
+            return min(kinds, g[1]), g[1]
+        return 0, 1
+
+    def quest_ready(self, q):
+        cur, need = self.quest_progress(q, self.qactive.get(q["id"], 0))
+        return cur >= need
+
+    def quest_active_for(self, giver):
+        for qid in self.qactive:
+            if QUEST_BY_ID[qid]["giver"] == giver:
+                return QUEST_BY_ID[qid]
+        return None
+
+    def quest_next(self, giver):
+        for q in QUESTS:
+            if q["giver"] == giver and q["id"] not in self.qdone and q["id"] not in self.qactive:
+                return q
+        return None
+
+    def npc_wants_talk(self, name):
+        act = self.quest_active_for(name)
+        if act:
+            return self.quest_ready(act)
+        return self.quest_next(name) is not None
+
+    def npc_marker(self, name):
+        act = self.quest_active_for(name)
+        if act:
+            return "done" if self.quest_ready(act) else None
+        return "new" if self.quest_next(name) else None
+
+    def accept_quest(self, q):
+        base = self.qstats.get(q["goal"][1], 0) if q["goal"][0] == "stat" else 0
+        first = not self.qdone and not self.qactive
+        self.qactive[q["id"]] = base
+        self.toast("New quest: %s" % q["title"])
+        if first:
+            self.toast("Press J to open your quest journal.")
+
+    def finish_quest(self, q):
+        if q["goal"][0] == "items":
+            for i, n in q["goal"][1].items():
+                self.take_item(i, n)
+        self.money += q["gold"]
+        extra = ""
+        if q["item"]:
+            self.add_item(q["item"], q["n"], quiet=True)
+            extra = " + %d %s" % (q["n"], ITEMS[q["item"]]["name"])
+        self.qactive.pop(q["id"], None)
+        self.qdone.add(q["id"])
+        self.toast("Quest complete: %s! +%dg%s" % (q["title"], q["gold"], extra), "coin")
+        self.sparkle(self.player.x, self.player.y - 10, 10)
+
+    def npc_talk(self, n):
+        act = self.quest_active_for(n.name)
+        if act:
+            cur, need = self.quest_progress(act, self.qactive[act["id"]])
+            if cur >= need:
+                self.finish_quest(act)
+                self.say(n.name, act["thanks"])
+                if act.get("wish"):
+                    self.wish_opts = [w for w in WISH_OPTIONS if w[0] not in self.wishes_done]
+                    self.wish_idx = 0
+                    if self.wish_opts:
+                        self.after_dialog = "wish"
+            else:
+                self.say(n.name, "%s  (%d / %d)" % (act["text"], cur, need))
+            return
+        nxt = self.quest_next(n.name)
+        if nxt:
+            self.accept_quest(nxt)
+            self.say(n.name, nxt["offer"])
+            return
+        self.say(n.name, random.choice(n.lines))
+
+    def draw_journal(self):
+        scr = self.screen
+        ov = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+        ov.fill((24, 14, 10, 160))
+        scr.blit(ov, (0, 0))
+        r = pygame.Rect(90, 60, WIN_W - 180, WIN_H - 120)
+        self.panel(r)
+        self.text("Quest Journal", (r.x + 24, r.y + 16), self.f_l, TEXT)
+        self.text("Completed %d / %d" % (len(self.qdone), len(QUESTS)), (r.right - 24, r.y + 24),
+                  self.f_m, PANEL_D, right=True)
+        y = r.y + 64
+        if not self.qactive:
+            self.text("No active quests. Talk to the villagers to find some!", (r.x + 24, y), self.f_m, PANEL_D)
+        for qid in list(self.qactive)[:6]:
+            q = QUEST_BY_ID[qid]
+            cur, need = self.quest_progress(q, self.qactive[qid])
+            self.text(q["title"], (r.x + 24, y), self.f_m, TEXT)
+            self.text("from " + q["giver"], (r.right - 24, y + 4), self.f_s, PANEL_D, right=True)
+            self.text(q["text"], (r.x + 24, y + 28), self.f_s, PANEL_D)
+            bar = pygame.Rect(r.x + 24, y + 52, r.w - 48, 12)
+            pygame.draw.rect(scr, (120, 84, 54), bar, border_radius=5)
+            fill = bar.copy()
+            fill.w = int(bar.w * clamp(cur / max(1, need), 0, 1))
+            pygame.draw.rect(scr, (110, 190, 80) if cur >= need else (240, 180, 60), fill, border_radius=5)
+            self.text("%d / %d" % (cur, need), (bar.right, y + 30), self.f_s, TEXT, right=True)
+            y += 74
+        self.text("J / Esc: close", (r.centerx, r.bottom - 26), self.f_s, PANEL_D, center=True)
+
+    # ------------------------------------------------------- cooking: order, bake, plate
+    def start_cook(self, key):
+        rec = RECIPES[key]
+        if not all(self.inv.get(i, 0) >= n for i, n in rec["needs"].items()):
+            self.toast("You're missing some ingredients.")
+            return
+        steps = []
+        for ing, n in rec["needs"].items():
+            steps += [ing] * n
+        rnd = random.Random(self.day * 97 + len(key) * 13 + random.randrange(10000))
+        self.cg = dict(key=key, steps=steps, buttons=list(rec["needs"].keys()), pos=0, mistakes=0,
+                       phase="prep", t=0.0, m=0.0, center=rnd.uniform(0.3, 0.7), half=0.08,
+                       stars=0, msg="", menu=dict(self.menu) if self.menu else dict(type="cook", idx=0, scroll=0))
+        self.menu = {}
+        self.state = "cookgame"
+
+    def cook_leave(self):
+        self.menu = self.cg["menu"]
+        self.state = "menu"
+        self.cg = None
+
+    def cook_finish(self, stars):
+        cg = self.cg
+        key = cg["key"]
+        cg["stars"], cg["phase"] = stars, "result"
+        msg = {3: "Perfect golden crust!", 2: "Tasty and well timed.",
+               1: "A little pale, but edible.", 0: "Burnt to a crisp. The ingredients are lost."}[stars]
+        cg["msg"] = msg
+        if stars == 0:
+            self.toast("Burnt! Nothing to serve.")
+            return
+        portions = {1: 1, 2: 1, 3: 2}[stars]
+        if random.random() < 0.05 * (self.level("cook") - 1):
+            portions += 1
+        self.add_item(key, portions, quiet=True)
+        self.toast("%s x%d (%s)" % (RECIPES[key]["name"], portions, "*" * stars))
+        self.gain_xp("cook", 4 + 3 * stars)
+        self.qinc("cook")
+        if stars == 3:
+            self.qinc("perfect")
+
+    def start_bake(self):
+        self.cg["phase"] = "bake"
+        self.cg["t"] = 0.0
+
+    def cook_stop(self):
+        cg = self.cg
+        d = abs(cg["m"] - cg["center"])
+        h = cg["half"]
+        acc = 1.0 - 0.5 * d / h if d <= h else max(0.0, 0.5 - (d - h) * 4)
+        prep = max(0.0, 1.0 - 0.2 * cg["mistakes"])
+        score = 0.4 * prep + 0.6 * acc
+        stars = 3 if score >= 0.85 else 2 if score >= 0.65 else 1 if score >= 0.4 else 0
+        if acc < 0.2:                                  # a badly missed bake burns, however neat the prep
+            stars = 0
+        self.cook_finish(stars)
+
+    def cookgame_key(self, ev):
+        cg = self.cg
+        k = ev.key
+        nums = (pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4, pygame.K_5, pygame.K_6)
+        if cg["phase"] == "prep":
+            if k == pygame.K_ESCAPE:
+                self.cook_leave()
+            elif k in nums and nums.index(k) < len(cg["buttons"]):
+                ing = cg["buttons"][nums.index(k)]
+                if ing == cg["steps"][cg["pos"]]:
+                    cg["pos"] += 1
+                    if cg["pos"] >= len(cg["steps"]):
+                        for i, n in RECIPES[cg["key"]]["needs"].items():
+                            self.take_item(i, n)
+                        self.start_bake()
+                else:
+                    cg["mistakes"] += 1
+                    self.toast("Not that one! The ticket says %s." % ITEMS[cg["steps"][cg["pos"]]]["name"])
+        elif cg["phase"] == "bake":
+            if k == pygame.K_ESCAPE:
+                self.cook_finish(0)
+            elif k in (pygame.K_SPACE, pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_e):
+                self.cook_stop()
+        elif cg["phase"] == "result":
+            if k in (pygame.K_SPACE, pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_e, pygame.K_ESCAPE):
+                self.cook_leave()
+
+    def update_cookgame(self, dt):
+        cg = self.cg
+        if cg is None:
+            return
+        cg["t"] += dt
+        if cg["phase"] == "bake":
+            p = (cg["t"] * 0.85) % 1.0
+            cg["m"] = 1.0 - abs(p * 2.0 - 1.0)        # the oven meter swings from 0 to 1 and back
+        self.update_effects(dt)
+
+    def draw_cookgame(self):
+        cg = self.cg
+        if cg is None:
+            return
+        scr = self.screen
+        ov = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+        ov.fill((24, 14, 10, 175))
+        scr.blit(ov, (0, 0))        rec = RECIPES[cg["key"]]
+        r = pygame.Rect(WIN_W // 2 - 300, 40, 600, 560)
+        self.panel(r)
+        self.text(rec["name"], (r.x + 24, r.y + 14), self.f_l, TEXT)
+        sub = {"prep": "Prep: add each ingredient in ticket order (keys 1-%d)" % len(cg["buttons"]),
+               "bake": "Bake: press Space or E when the meter is in the golden zone",
+               "result": "Space or E to return to the kitchen"}[cg["phase"]]
+        self.text(sub, (r.x + 24, r.y + 50), self.f_s, PANEL_D)
+
+        tk = pygame.Rect(r.x + 24, r.y + 84, 220, 300)
+        pygame.draw.rect(scr, (250, 240, 214), tk, border_radius=8)
+        pygame.draw.rect(scr, INK, tk, 2, border_radius=8)
+        self.text("ORDER TICKET", (tk.x + 14, tk.y + 10), self.f_s, PANEL_D)
+        y = tk.y + 40
+        for i, ing in enumerate(cg["steps"]):
+            done = i < cg["pos"]
+            cur = i == cg["pos"] and cg["phase"] == "prep"
+            col = (50, 120, 50) if done else (170, 50, 40) if cur else TEXT
+            mark = "[x]" if done else ">" if cur else "[ ]"
+            self.text("%s %s" % (mark, ITEMS[ing]["name"]), (tk.x + 14, y), self.f_m if cur else self.f_s, col)
+            y += 30
+
+        mx = tk.right + 30
+        mw = r.right - 24 - mx
+        self.text("Oven", (mx, tk.y + 10), self.f_s, PANEL_D)
+        bar = pygame.Rect(mx, tk.y + 40, mw, 34)
+        pygame.draw.rect(scr, (90, 60, 40), bar, border_radius=6)
+        zone = pygame.Rect(bar.x + int((cg["center"] - cg["half"]) * bar.w), bar.y,
+                           max(2, int(2 * cg["half"] * bar.w)), bar.h)
+        pygame.draw.rect(scr, (250, 210, 80), zone, border_radius=4)
+        mxp = bar.x + int(cg["m"] * bar.w)
+        pygame.draw.rect(scr, (255, 255, 255), (mxp - 2, bar.y - 6, 4, bar.h + 12), border_radius=2)
+        pygame.draw.rect(scr, INK, bar, 2, border_radius=6)
+        if cg["phase"] == "prep":
+            self.text("Oven waits for your ingredients...", (mx, bar.bottom + 14), self.f_s, PANEL_D)
+        self.text("Mistakes: %d" % cg["mistakes"], (mx, bar.bottom + 40), self.f_s, TEXT)
+        if cg["phase"] == "result":
+            for i in range(3):
+                draw_star(scr, mx + 30 + i * 52, bar.bottom + 110, 20, GOLD if i < cg["stars"] else (92, 64, 44))
+            self.text(cg["msg"], (mx, bar.bottom + 150), self.f_m, TEXT)
+
+        n = len(cg["buttons"])
+        bw = min(140, (r.w - 48 - 8 * (n - 1)) // n)
+        for i, ing in enumerate(cg["buttons"]):
+            br = pygame.Rect(r.x + 24 + i * (bw + 8), r.bottom - 96, bw, 60)
+            active = cg["phase"] == "prep" and cg["steps"][cg["pos"]] == ing
+            pygame.draw.rect(scr, (255, 226, 150) if active else (255, 246, 226), br, border_radius=8)
+            pygame.draw.rect(scr, INK, br, 2, border_radius=8)
+            scr.blit(pygame.transform.scale(self.icons[ing], (32, 32)), (br.x + 8, br.y + 14))
+            self.text("%d %s" % (i + 1, ITEMS[ing]["name"]), (br.x + 46, br.y + 8), self.f_s, TEXT)
+            self.text("need %d" % RECIPES[cg["key"]]["needs"][ing], (br.x + 46, br.y + 32), self.f_s, PANEL_D)
+        if cg["phase"] == "prep":
+            self.text("Esc: leave", (r.right - 24, r.bottom - 22), self.f_s, PANEL_D, right=True)
+
     def new_game(self):
         self.day = 1
         self.time = WAKE_HOUR
@@ -814,6 +4072,7 @@ class Game:
         self.passed_out = False
         self.smoke_t = 0.0
         self.rain_drops = [[random.uniform(0, VIEW_W), random.uniform(0, VIEW_H)] for _ in range(110)]
+        self.init_extras()
         self.ensure_season()
         self.new_world()
         self.player = Player(30 * TILE, 14 * TILE + 8)
@@ -838,6 +4097,7 @@ class Game:
         return 1 + (self.day - 1) // (DAYS_PER_SEASON * len(SEASONS))
 
     def new_world(self):
+        self.location, self.farm_world, self.tables = "farm", None, []
         rnd = random.Random(1337)
         T = [[GRASS] * MAP_W for _ in range(MAP_H)]
         self.tiles = T
@@ -853,6 +4113,12 @@ class Game:
         prect(24, 12, 39, 12)
         prect(36, 11, 39, 11)
         prect(46, 17, 61, 23)
+        # Road from the farm down to the bridge, the bridge's east approach, and the village street.
+        prect(62, 22, 63, 44)
+        prect(62, 44, 79, 45)
+        prect(90, 44, 124, 45)
+        for hx in (98, 106, 114):                 # a short lane to each village front door
+            prect(hx + 2, 42, hx + 2, 43)
         cx, cy, rx, ry = 11, 30, 6, 4
         for y in range(MAP_H):
             for x in range(MAP_W):
@@ -861,12 +4127,52 @@ class Game:
                     T[y][x] = WATER
                 elif d <= 1.7 and T[y][x] == GRASS:
                     T[y][x] = SAND
+        cx2, cy2, rx2, ry2 = 84, 58, 8, 5
+        for y in range(MAP_H):
+            for x in range(MAP_W):
+                d = ((x - cx2) / rx2) ** 2 + ((y - cy2) / ry2) ** 2
+                if d <= 1.0:
+                    T[y][x] = WATER
+                elif d <= 1.7 and T[y][x] == GRASS:
+                    T[y][x] = SAND
+        # A winding river runs down the eastern side of the farm/village.
+        # Keep just one broad wooden crossing, aligned with the Fish Master route.
+        for y in range(MAP_H):
+            center = river_center(y)
+            for x in range(center - 3, center + 4):
+                if 0 <= x < MAP_W:
+                    T[y][x] = WATER
+            for x in (center - 5, center - 4, center + 4, center + 5):
+                if 0 <= x < MAP_W and T[y][x] == GRASS:
+                    T[y][x] = SAND
+        # One big bridge: wide enough to read as a main route, three tiles deep.
+        bridge_y = 44
+        bridge_center = river_center(bridge_y)
+        for yy in range(BRIDGE_ROWS[0], BRIDGE_ROWS[1] + 1):
+            for xx in range(bridge_center - 6, bridge_center + 7):
+                if 0 <= xx < MAP_W:
+                    T[yy][xx] = BRIDGE
+
+        # A harbour basin at the far east end of the map, past the secondary village. The ferry port sits on its north shore.
+        for yy in range(44, 47):
+            for xx in range(120, 127):
+                T[yy][xx] = WATER
+
         self.buildings = [
             dict(kind="house", tx=27, ty=5, w=6, h=5),
+            dict(kind="village_house", tx=98, ty=37, w=6, h=5),
+            dict(kind="village_house2", tx=106, ty=37, w=6, h=5),
+            dict(kind="village_house3", tx=114, ty=37, w=6, h=5),
             dict(kind="kitchen", tx=36, ty=8, w=4, h=3),
             dict(kind="bin", tx=24, ty=11, w=2, h=1),
             dict(kind="stall", tx=50, ty=15, w=5, h=3),
             dict(kind="coop", tx=45, ty=26, w=3, h=2),
+            dict(kind="cafe", tx=38, ty=15, w=8, h=4),
+            dict(kind="bench", tx=35, ty=6, w=2, h=1),
+            dict(kind="dock", tx=10, ty=35, w=2, h=1),
+            dict(kind="village_port", tx=VILLAGE_PORT_TX, ty=VILLAGE_PORT_TY, w=2, h=1),
+            dict(kind="port_house", tx=PORT_HOUSE_TX, ty=PORT_HOUSE_TY, w=6, h=5),
+            dict(kind="arcade", tx=57, ty=17, w=2, h=1),
         ]
         self.bld_at = {}
         for b in self.buildings:
@@ -896,6 +4202,8 @@ class Game:
                 res.add((x, y))
         for l in self.lamps:
             res.add(l)
+        for x in range(37, 47):
+            res.add((x, 19))
         self.reserved = res
         self.objs = {}
 
@@ -920,9 +4228,21 @@ class Game:
                 put(x, y, t, v=rnd.randrange(3 if t != "tree" else 2), **kw)
                 placed += 1
 
-        scatter("tree", 26, hp=4)
-        scatter("rock", 30, hp=3)
-        scatter("flower", 42)
+        scatter("tree", 130, hp=4)
+        # Keep the entire eastern side clear so the river and buildable village land are visible.
+        for pos, obj in list(self.objs.items()):
+            # Keep the river and the whole eastern bank free of trees so the
+            # crafted villager-house area is open and reachable.
+            if pos[0] >= 60 and obj["t"] == "tree":
+                del self.objs[pos]
+        scatter("rock", 85, hp=3)
+        scatter("flower", 160)
+        # Clear the east bank (river and village land) and every object standing on a road,
+        # path, sand or water tile, so the bridge route and village land stay open.
+        for pos in list(self.objs):
+            x, y = pos
+            if (x >= 60 and self.objs[pos]["t"] == "tree") or east_clear(x, y) or T[y][x] != GRASS:
+                del self.objs[pos]
         for (x, y) in list(self.objs):
             if 20 <= x <= 42 and 13 <= y <= 26 and rnd.random() < 0.85:
                 del self.objs[(x, y)]
@@ -934,14 +4254,33 @@ class Game:
         self.chickens = [Chicken(45 * TILE + i * 28, 30 * TILE + (i % 2) * 14) for i in range(3)]
         mabel = NPC("Mabel", 52 * TILE + 8, 16 * TILE + 13, SPR["mabel"], MABEL_LINES)
         fern = NPC("Fern", 54 * TILE, 21 * TILE, SPR["fern"], FERN_LINES, wander=(47, 18, 60, 22))
-        self.npcs = [mabel, fern]
+        fisherman = NPC("Fisherman", 95 * TILE + 8, 46 * TILE + 8, SPR["fisherman"], FISHERMAN_LINES,
+                        wander=(93, 46, 97, 49))
+
+        def npc_at(name, tx, ty, sprite, lines, wander=None):
+            self.objs.pop((tx, ty), None)            # nobody spawns inside a tree or rock
+            return NPC(name, tx * TILE + 8, ty * TILE + 8, SPR[sprite], lines, wander=wander)
+
+        for xx in range(VILLAGE_PORT_TX, VILLAGE_PORT_TX + 2):
+            self.objs.pop((xx, VILLAGE_PORT_TY), None)
+        for yy in range(PORT_HOUSE_TY, PORT_HOUSE_TY + 5):
+            for xx in range(PORT_HOUSE_TX, PORT_HOUSE_TX + 6):
+                self.objs.pop((xx, yy), None)
+        self.npcs = [
+            mabel, fern, fisherman,
+            npc_at("Gus", 41, 11, "gus", GUS_LINES, wander=(39, 10, 45, 13)),
+            npc_at("Lila", 26, 30, "lila", LILA_LINES, wander=(22, 28, 30, 34)),
+            npc_at("Pip", 62, 27, "pip", PIP_LINES, wander=(60, 26, 68, 30)),
+            npc_at("Tomas", 116, 43, "tomas", TOMAS_LINES, wander=(112, 42, 120, 46)),
+            npc_at("Dario", 120, 42, "dario", DARIO_LINES, wander=(118, 42, 124, 42)),
+        ]
         self.eggs = []
 
     def rebuild_solid(self):
         S = [[False] * MAP_W for _ in range(MAP_H)]
         for y in range(MAP_H):
             for x in range(MAP_W):
-                if self.tiles[y][x] == WATER:
+                if self.tiles[y][x] in (WATER, WALL):
                     S[y][x] = True
         for (x, y) in self.bld_at:
             S[y][x] = True
@@ -952,6 +4291,8 @@ class Game:
         for (x, y), o in self.objs.items():
             if o["t"] in ("tree", "rock", "stump"):
                 S[y][x] = True
+        for tb in self.active_tables():
+            S[tb["ty"]][tb["tx"]] = True
         self.solid = S
 
     def new_critter(self):
@@ -962,13 +4303,273 @@ class Game:
     def has_save(self):
         return os.path.exists(SAVE_FILE)
 
+    WORLD_KEYS = ("tiles", "solid", "objs", "buildings", "bld_at", "lamps", "fences",
+                  "reserved", "soil", "chickens", "npcs", "eggs", "tables")
+
+    def _save_src(self):
+        if self.location != "farm" and self.farm_world:
+            return dict(soil=self.farm_world["soil"], objs=self.farm_world["objs"])
+        return dict(soil=self.soil, objs=self.objs)
+
+    def _save_pos(self):
+        if self.location in ("island", "station"):
+            return FARM_DOCK_OUT
+        if self.location == "portHouse":
+            return PORT_HOUSE_OUT
+        if self.location != "farm":
+            return CAFE_EXIT_OUT
+        return (self.player.x, self.player.y)
+
+    def start_warp(self, target):
+        self.warp = dict(target=target, t=0.0, switched=False)
+        self.fade = 0.0
+        self.state = "warp"
+
+    def update_warp(self, dt):
+        w = self.warp
+        half = 0.35
+        w["t"] += dt
+        if not w["switched"]:
+            self.fade = min(1.0, w["t"] / half)
+            if w["t"] >= half:
+                self.switch_location(w["target"])
+                w["switched"], w["t"], self.fade = True, 0.0, 1.0
+        else:
+            self.fade = max(0.0, 1.0 - w["t"] / half)
+            if w["t"] >= half:
+                self.state, self.warp, self.fade = "play", None, 0.0
+        self.update_effects(dt)
+
+    def switch_location(self, target):
+        if target != "farm" and self.location not in ("farm", target):
+            self.switch_location("farm")          # sail back to the farm, then on to the new place
+        if target != "farm" and self.location == "farm":
+            self.farm_world = {k: getattr(self, k) for k in self.WORLD_KEYS}
+            if target in ("island", "station"):
+                self.qinc("sail")
+            if target == "island":
+                self.build_island()
+                self.toast("Welcome to the island! Everyone who sails here can meet.")
+                spawn, facing = ISLAND_SPAWN, "up"
+            elif target == "station":
+                self.build_station()
+                self.toast("The Ruined Station. Search the ruins for scrap and old coins.")
+                spawn, facing = STATION_SPAWN, "left"
+            else:
+                if target == "cafe":
+                    self.build_cafe_interior()
+                    self.toast("Welcome to your cafe!")
+                elif target == "portHouse":
+                    self.build_port_house_interior()
+                    self.toast("The port house smells of salt and old magic.")
+                else:
+                    self.build_house_interior()
+                    self.toast("Home sweet home.")
+                spawn, facing = CAFE_DOOR_IN, "down"
+            self.location = target
+            self.player.x, self.player.y = spawn
+            self.player.dir = facing
+        elif target == "farm" and self.location != "farm":
+            out = {"house": HOUSE_EXIT_OUT, "island": FARM_DOCK_OUT, "station": FARM_DOCK_OUT,
+                   "portHouse": PORT_HOUSE_OUT}.get(self.location, CAFE_EXIT_OUT)
+            if self.location == "island" and self.last_port == "village":
+                out = VILLAGE_PORT_OUT             # the ferry brings you back to the port you left from
+            self.last_port = "farm"
+            self.customers = []
+            for k, v in self.farm_world.items():
+                setattr(self, k, v)
+            self.farm_world = None
+            self.location = "farm"
+            self.player.x, self.player.y = out
+            self.player.dir = "up"
+        self.focus = None
+        self.rebuild_solid()
+
+    def build_island(self):
+        """An island in the sea. Shared by everyone who sails there in multiplayer."""
+        T = [[WATER] * MAP_W for _ in range(MAP_H)]
+        cx, cy, rx, ry = 60, 46, 28, 22
+        for y in range(MAP_H):
+            for x in range(MAP_W):
+                d = ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2
+                if d <= 1.0:
+                    T[y][x] = GRASS
+                elif d <= 1.2:
+                    T[y][x] = SAND
+                if ((x - 70) / 4) ** 2 + ((y - 40) / 3) ** 2 <= 1.0:
+                    T[y][x] = WATER
+        self.tiles = T
+        self.buildings = [dict(kind="dock_back", tx=34, ty=46, w=2, h=1),
+                          dict(kind="port", tx=84, ty=44, w=2, h=1)]
+        self.bld_at = {}
+        for b in self.buildings:
+            for yy in range(b["ty"], b["ty"] + b["h"]):
+                for xx in range(b["tx"], b["tx"] + b["w"]):
+                    self.bld_at[(xx, yy)] = b
+        rnd = random.Random(77)
+        self.objs = {}
+        for y in range(MAP_H):
+            for x in range(MAP_W):
+                if T[y][x] != GRASS or abs(x - 34) < 3 and abs(y - 46) < 3 or abs(x - 84.5) < 2.5 and abs(y - 44) < 3:
+                    continue
+                r = rnd.random()
+                if r < 0.05:
+                    self.objs[(x, y)] = dict(t="tree", hp=4, v=rnd.randrange(2))
+                elif r < 0.08:
+                    self.objs[(x, y)] = dict(t="rock", hp=3, v=rnd.randrange(3))
+                elif r < 0.25:
+                    self.objs[(x, y)] = dict(t="flower", v=rnd.randrange(3))
+        self.tables = []
+        self.lamps, self.fences, self.reserved = [], set(), set()
+        self.soil, self.chickens, self.eggs = {}, [], []
+        self.npcs = [NPC("Fish Master", 58 * TILE + 8, 44 * TILE + 8, SPR["fishmaster"],
+                         FISH_MASTER_LINES, wander=(56, 42, 62, 48)),
+                      NPC("Coral", 46 * TILE + 8, 46 * TILE + 8, SPR["coral"], CORAL_LINES,
+                          wander=(42, 42, 50, 50))]
+        self.customers = []
+        self.rebuild_solid()
+
+    def build_station(self):
+        """The Ruined Station: an old sea port on a rocky shore. Searching the ruins finds scrap."""
+        T = [[WATER] * MAP_W for _ in range(MAP_H)]
+        cx, cy, rx, ry = 48, 36, 26, 20
+        for y in range(MAP_H):
+            for x in range(MAP_W):
+                d = ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2
+                if d <= 1.0:
+                    T[y][x] = GRASS
+                elif d <= 1.2:
+                    T[y][x] = SAND
+        self.tiles = T
+        self.buildings = [
+            dict(kind="dock_back", tx=23, ty=37, w=2, h=1),
+            dict(kind="ruin", tx=34, ty=28, w=3, h=2),
+            dict(kind="ruin", tx=44, ty=40, w=3, h=2),
+            dict(kind="ruin", tx=56, ty=29, w=3, h=2),
+            dict(kind="ruin", tx=60, ty=40, w=3, h=2),
+        ]
+        self.bld_at = {}
+        for b in self.buildings:
+            for yy in range(b["ty"], b["ty"] + b["h"]):
+                for xx in range(b["tx"], b["tx"] + b["w"]):
+                    self.bld_at[(xx, yy)] = b
+        rnd = random.Random(1912)
+        self.objs = {}
+        for y in range(MAP_H):
+            for x in range(MAP_W):
+                if T[y][x] != GRASS or (abs(x - 23) < 3 and abs(y - 37) < 3) or (x, y) in self.bld_at:
+                    continue
+                r = rnd.random()
+                if r < 0.06:
+                    self.objs[(x, y)] = dict(t="rock", hp=3, v=rnd.randrange(3))
+                elif r < 0.09:
+                    self.objs[(x, y)] = dict(t="tree", hp=4, v=rnd.randrange(2))
+        self.tables = []
+        self.lamps, self.fences, self.reserved = [], set(), set()
+        self.soil, self.chickens, self.eggs = {}, [], []
+        self.npcs = [NPC("Old Salt", 29 * TILE + 8, 38 * TILE + 8, SPR["oldsalt"], SALT_LINES,
+                         wander=(27, 35, 33, 40))]
+        self.customers = []
+        self.station_looted = set()
+        self.rebuild_solid()
+
+    def search_ruin(self, b):
+        """Digs through a ruin. Each ruin can be searched once per visit."""
+        spot = (b["tx"], b["ty"])
+        if spot in self.station_looted:
+            self.toast("Already searched. Nothing else is left here.")
+            return
+        self.station_looted.add(spot)
+        rnd = random.Random(spot[0] * 131 + spot[1] * 7 + self.day)
+        found = []
+        for _ in range(rnd.randrange(2, 5)):
+            roll = rnd.random()
+            item = "scrap" if roll < 0.5 else "stone" if roll < 0.75 else "old_coin" if roll < 0.9 else "wood"
+            n = rnd.randrange(1, 4)
+            self.add_item(item, n, quiet=True)
+            found.append("%d %s" % (n, ITEMS[item]["name"]))
+        self.toast("Searched the ruins: " + ", ".join(found), "scrap")
+        self.qinc("ruin")
+
+    def build_port_house_interior(self):
+        """Inside the port house: one room, Crazy Dew, and the door back to the harbour."""
+        T = [[WALL] * MAP_W for _ in range(MAP_H)]
+        for y in range(RY0 + 1, RY1):
+            for x in range(RX0 + 1, RX1):
+                T[y][x] = WOOD_FLOOR
+        self.tiles = T
+        self.buildings = [dict(kind="exitdoor", tx=32, ty=RY1, w=1, h=1)]
+        self.bld_at = {}
+        for b in self.buildings:
+            for yy in range(b["ty"], b["ty"] + b["h"]):
+                for xx in range(b["tx"], b["tx"] + b["w"]):
+                    self.bld_at[(xx, yy)] = b
+        self.tables = []
+        self.lamps, self.fences, self.reserved = [], set(), set()
+        self.objs, self.soil, self.chickens, self.eggs = {}, {}, [], []
+        self.customers = []
+        self.npcs = [NPC("Crazy Dew", 26 * TILE + 8, (RY0 + 4) * TILE + 8, SPR["crazy_dew"], CRAZY_LINES)]
+        self.rebuild_solid()
+
+    def build_house_interior(self):
+        """The inside of your house: a bed to sleep in and the computer (once built)."""
+        T = [[WALL] * MAP_W for _ in range(MAP_H)]
+        for y in range(RY0 + 1, RY1):
+            for x in range(RX0 + 1, RX1):
+                T[y][x] = WOOD_FLOOR
+        self.tiles = T
+        self.buildings = [
+            dict(kind="bed", tx=22, ty=RY0 + 2, w=2, h=1),
+            dict(kind="computer", tx=28, ty=RY0 + 2, w=2, h=1),
+            dict(kind="exitdoor", tx=32, ty=RY1, w=1, h=1),
+        ]
+        self.bld_at = {}
+        for b in self.buildings:
+            for yy in range(b["ty"], b["ty"] + b["h"]):
+                for xx in range(b["tx"], b["tx"] + b["w"]):
+                    self.bld_at[(xx, yy)] = b
+        self.tables = []
+        self.lamps, self.fences, self.reserved = [], set(), set()
+        self.objs, self.soil, self.chickens, self.npcs, self.eggs = {}, {}, [], [], []
+        self.customers = []
+        self.rebuild_solid()
+
+    def build_cafe_interior(self):
+        T = [[WALL] * MAP_W for _ in range(MAP_H)]
+        for y in range(RY0 + 1, RY1):
+            for x in range(RX0 + 1, RX1):
+                T[y][x] = WOOD_FLOOR
+        self.tiles = T
+        self.buildings = [
+            dict(kind="stove", tx=23, ty=RY0 + 2, w=3, h=1),
+            dict(kind="register", tx=29, ty=RY0 + 2, w=3, h=1),
+            dict(kind="exitdoor", tx=32, ty=RY1, w=1, h=1),
+        ]
+        self.bld_at = {}
+        for b in self.buildings:
+            for yy in range(b["ty"], b["ty"] + b["h"]):
+                for xx in range(b["tx"], b["tx"] + b["w"]):
+                    self.bld_at[(xx, yy)] = b
+        self.tables = [dict(tx=x, ty=22, cust=None) for x in (25, 30, 35, 40)]
+        self.lamps, self.fences, self.reserved = [], set(), set()
+        self.objs, self.soil, self.chickens, self.npcs, self.eggs = {}, {}, [], [], []
+        self.customers = []
+        self.cust_timer = 4.0
+        self.rebuild_solid()
+
     def save_game(self):
         try:
             data = dict(day=self.day, time=self.time, money=self.money, energy=self.energy, water=self.water,
                         rain=self.rain, inv=self.inv, bin=self.bin,
-                        soil=[[x, y, s["wet"], s["crop"], s["age"]] for (x, y), s in self.soil.items()],
-                        objs=[[x, y, o["t"], o.get("hp", 1), o.get("v", 0)] for (x, y), o in self.objs.items()],
-                        eggs=self.eggs, px=self.player.x, py=self.player.y)
+                        soil=[[x, y, s["wet"], s["crop"], s["age"]] for (x, y), s in self._save_src()["soil"].items()],
+                        objs=[[x, y, o["t"], o.get("hp", 1), o.get("v", 0)] for (x, y), o in self._save_src()["objs"].items()],
+                        eggs=self.eggs, px=self._save_pos()[0], py=self._save_pos()[1],
+                        owned=sorted(self.owned), unlocked=self.unlocked, menu_on=self.menu_on, rep=self.rep,
+                        xp=self.xp, pending=self.pending, hi=self.hi, cafe_open=self.cafe_open,
+                        fish_log=self.fish_log,
+                        houses=[[b["tx"], b["ty"]] for b in self.buildings if b.get("player_built")],
+                        qdone=sorted(self.qdone), qactive=self.qactive, qstats=self.qstats,
+                        wishes=sorted(self.wishes_done))
             with open(SAVE_FILE, "w") as f:
                 json.dump(data, f)
             return True
@@ -987,7 +4588,35 @@ class Game:
         self.inv, self.bin = d["inv"], d["bin"]
         self.soil = {(x, y): dict(wet=w, crop=c, age=a) for x, y, w, c, a in d["soil"]}
         self.objs = {(x, y): dict(t=t, hp=hp, v=v) for x, y, t, hp, v in d["objs"]}
+        # Also clean older save files, which may still contain trees on the east bank.
+        # Older saves may still hold trees or rocks on the cleared east bank, or objects on roads.
+        self.objs = {pos: obj for pos, obj in self.objs.items()
+                     if not (pos[0] >= 60 and obj.get("t") == "tree")
+                     and not east_clear(*pos) and self.tiles[pos[1]][pos[0]] == GRASS}
         self.eggs = d.get("eggs", [])
+        self.owned = set(d.get("owned", []))
+        self.unlocked = d.get("unlocked", list(UNLOCKED_START))
+        self.menu_on = d.get("menu_on", {})
+        self.rep = d.get("rep", 20.0)
+        self.xp = d.get("xp", {"farm": 0, "cook": 0, "fish": 0})
+        self.pending = d.get("pending", {})
+        self.hi = dict(HI_DEFAULT)
+        self.hi.update(d.get("hi", {}))
+        self.cafe_open = d.get("cafe_open", True)
+        self.fish_log = d.get("fish_log", {})
+        self.qdone = set(d.get("qdone", []))
+        self.qactive = {k: int(v) for k, v in d.get("qactive", {}).items()}
+        self.qstats = dict(d.get("qstats", {}))
+        self.wishes_done = set(d.get("wishes", []))
+        houses = d.get("houses")
+        if houses is None and "villager_house" in self.owned:
+            # Older save: the house used to be placed automatically, so hand back its kit instead.
+            self.add_item("villager_house_kit", 1, quiet=True)
+        self.owned.discard("villager_house")
+        for tx, ty in houses or []:
+            if self.house_problem(tx, ty, check_player=False) is None:
+                self.add_building(tx, ty)
+        self.recalc()
         self.player.x, self.player.y = d["px"], d["py"]
         self.ensure_season()
         self.rebuild_solid()
@@ -997,7 +4626,9 @@ class Game:
     def hotbar(self):
         keys = list(TOOLS)
         keys += [k for k in ITEMS if ITEMS[k]["kind"] == "seed" and self.inv.get(k, 0) > 0]
-        keys += [k for k in RECIPES if self.inv.get(k, 0) > 0]
+        keys += [k for k, v in ITEMS.items() if v["kind"] == "food" and self.inv.get(k, 0) > 0]
+        if self.inv.get("villager_house_kit", 0) > 0:
+            keys.append("villager_house_kit")
         return keys[:12]
 
     def add_item(self, key, n=1, quiet=False):
@@ -1084,6 +4715,9 @@ class Game:
         if not keys:
             return
         key = keys[clamp(self.sel, 0, len(keys) - 1)]
+        if key == "villager_house_kit":
+            self.start_placing()
+            return
         tx, ty = self.facing_tile()
         s = self.soil.get((tx, ty))
         if s and self.is_ripe(s):
@@ -1097,6 +4731,7 @@ class Game:
                 s["crop"] = ITEMS[key]["crop"]
                 s["age"] = 0
                 self.take_item(key)
+                self.qinc("plant")
                 self.burst(tx * TILE + 8, ty * TILE + 8, (140, 100, 64), 6, 24, 80, 0.4, 1)
                 self.swing(None)
             else:
@@ -1121,10 +4756,19 @@ class Game:
         o = self.objs.get((tx, ty))
         s = self.soil.get((tx, ty))
         tt = self.tiles[ty][tx]
-        cost = TOOL_COST[key]
+        cost = self.tool_cost(key)
         self.swing(key)
+        if key == "rod":
+            if tt != WATER:
+                self.toast("Cast your rod at the pond.")
+            elif self.energy < cost:
+                self.toast("You're too tired! Eat something or go to sleep.")
+            else:
+                self.energy -= cost
+                self.start_fishing(tx, ty)
+            return
         if key == "can" and tt == WATER:
-            self.water = 20
+            self.water = self.water_cap()
             self.burst(cx, cy, (150, 200, 240), 10, 40, 100, 0.5)
             self.toast("Watering can refilled!")
             return
@@ -1153,6 +4797,7 @@ class Game:
         elif key == "can":
             s["wet"] = True
             self.water -= 1
+            self.qinc("water")
             self.burst(cx, cy, (140, 190, 240), 10, 30, 90, 0.5)
         elif key == "axe":
             o["shake"] = 0.3
@@ -1185,7 +4830,10 @@ class Game:
         s = self.soil[(tx, ty)]
         crop = s["crop"]
         s["crop"], s["age"] = None, 0
-        self.add_item(crop)
+        n = 2 if random.random() < 0.04 * (self.level("farm") - 1) else 1
+        self.add_item(crop, n)
+        self.qinc("harvest", n)
+        self.gain_xp("farm", 3 + CROPS[crop]["days"])
         cx, cy = tx * TILE + 8, ty * TILE + 8
         self.burst(cx, cy, CROPS[crop]["fruit"], 8, 50, 120, 0.6)
         self.sparkle(cx, cy)
@@ -1196,12 +4844,16 @@ class Game:
         self.focus = None
         cx, cy = tx * TILE + 8, ty * TILE + 8
         for n in self.npcs:
-            if n.wander and math.hypot(n.x - cx, n.y - 8 - cy) < 20:
+            if math.hypot(n.x - cx, n.y - 8 - cy) < 20:
                 self.focus = ("npc", n)
                 return
         for c in self.chickens:
             if math.hypot(c.x - cx, c.y - cy) < 14:
                 self.focus = ("chicken", c)
+                return
+        for tb in self.active_tables():
+            if (tx, ty) == (tb["tx"], tb["ty"]):
+                self.focus = ("table", tb)
                 return
         b = self.bld_at.get((tx, ty))
         if b:
@@ -1220,15 +4872,23 @@ class Game:
             return None
         kind, data = self.focus
         if kind == "npc":
-            return "E  Talk"
+            return "E  Talk to %s" % data.name
         if kind == "chicken":
             return "E  Pet"
         if kind == "crop":
             return "E  Harvest"
         if kind == "flower":
             return "E  Pick"
-        return {"house": "E  Sleep", "kitchen": "E  Cook", "bin": "E  Ship goods",
-                "stall": "E  Shop", "coop": "E  Look"}[data["kind"]]
+        if kind == "table":
+            c = data["cust"]
+            return "E  Serve" if (c and c.state == "wait") else "E  Table"
+        return {"dock": "E  Sail to the island", "dock_back": "E  Sail home",
+                "village_port": "E  Board the ferry to the island", "port_house": "E  Enter the port house",
+                "port": "E  Sail to the Ruined Station", "ruin": "E  Search the ruins",
+                "house": "E  Enter house", "bed": "E  Sleep", "computer": "E  Use computer",
+                "bench": "E  Workbench", "kitchen": "E  Cook", "bin": "E  Ship goods",
+                "stall": "E  Shop", "coop": "E  Look", "cafe": "E  Enter cafe", "register": "E  Register", "stove": "E  Cook", "exitdoor": "E  Leave",
+                "pc": "E  Use computer", "arcade": "E  Play arcade"}.get(data["kind"])
 
     def interact(self):
         if self.player.act > 0 or not self.focus:
@@ -1240,16 +4900,46 @@ class Game:
             del self.objs[data]
             self.add_item("flower")
             self.sparkle(data[0] * TILE + 8, data[1] * TILE + 8, 4)
+        elif kind == "npc" and data.name == "Fish Master" and not self.npc_wants_talk(data.name):
+            self.menu = dict(type="fishmaster", idx=0, view="list")
+            self.state = "menu"
         elif kind == "npc":
-            self.say(data.name, random.choice(data.lines))
+            self.npc_talk(data)
         elif kind == "chicken":
+            self.qinc("pet")
             self.heart(data.x, data.y - 10)
             self.toast("Bwaaaak! Your hen seems happy.")
+        elif kind == "table":
+            self.serve_table(data)
         elif kind == "bld":
             k = data["kind"]
             if k == "house":
+                self.start_warp("house")
+            elif k == "bed":
                 self.menu = dict(type="sleep", idx=1)
                 self.state = "menu"
+            elif k == "computer":
+                if "computer" in self.owned:
+                    self.menu = dict(type="pc", tab=0, idx=0, scroll=0)
+                    self.state = "menu"
+                else:
+                    self.toast("Your computer is not built yet. Craft it at the workbench.")
+            elif k == "bench":
+                self.menu = dict(type="bench", idx=0, scroll=0)
+                self.state = "menu"
+            elif k == "dock":
+                self.start_warp("island")
+            elif k == "dock_back":
+                self.start_warp("farm")
+            elif k == "port":
+                self.start_warp("station")
+            elif k == "village_port":
+                self.last_port = "village"
+                self.start_warp("island")
+            elif k == "port_house":
+                self.start_warp("portHouse")
+            elif k == "ruin":
+                self.search_ruin(data)
             elif k == "kitchen":
                 self.menu = dict(type="cook", idx=0, scroll=0)
                 self.state = "menu"
@@ -1261,13 +4951,31 @@ class Game:
                 self.state = "menu"
             elif k == "coop":
                 self.toast("Your hens lay fresh eggs every morning.")
+            elif k == "cafe":
+                self.start_warp("cafe")
+            elif k == "register":
+                self.menu = dict(type="cafe", idx=0, scroll=0)
+                self.state = "menu"
+            elif k == "stove":
+                self.menu = dict(type="cook", idx=0, scroll=0)
+                self.state = "menu"
+            elif k == "exitdoor":
+                self.start_warp("farm")
+            elif k == "pc":
+                self.menu = dict(type="pc", tab=0, idx=0, scroll=0)
+                self.state = "menu"
+            elif k == "arcade":
+                self.menu = dict(type="arcade", idx=0, scroll=0)
+                self.state = "menu"
 
     def say(self, name, text):
-        self.dialog = dict(name=name, text=text, shown=0.0)
+        self.dialog = dict(name=name, text=text, shown=0.0, portrait=PORTRAITS.get(name))
         self.state = "dialog"
 
     # ------------------------------------------------------- day cycle
     def start_end_day(self, passed):
+        if self.location != "farm":
+            self.switch_location("farm")
         self.passed_out = passed
         self.state = "fade_out"
         self.fade = 0.0
@@ -1275,7 +4983,9 @@ class Game:
     def process_new_day(self):
         lines, earned = [], 0
         for k, n in list(self.bin.items()):
-            v = ITEMS[k]["sell"] * n
+            v = int(ITEMS[k]["sell"] * n * (self.cook_bonus() if ITEMS[k]["kind"] == "food" else 1.0))
+            if k in FISH:
+                v = int(v * (1 + self.fish_mastery()[2]))
             lines.append((k, n, v))
             earned += v
         self.money += earned
@@ -1283,8 +4993,17 @@ class Game:
         for s in self.soil.values():
             if s["crop"] and s["wet"] and s["age"] < CROPS[s["crop"]]["days"]:
                 s["age"] += 1
-            s["wet"] = False
-        self.summary = dict(day=self.day, lines=lines, earned=earned, passed=self.passed_out)
+            s["wet"] = False        deliveries = list(self.pending.items())
+        for k, n in deliveries:
+            self.inv[k] = self.inv.get(k, 0) + n
+        self.pending = {}
+        self.summary = dict(day=self.day, lines=lines, earned=earned, passed=self.passed_out,
+                            cafe=dict(self.cafe_stats), deliveries=deliveries)
+        self.cafe_stats = dict(served=0, earned=0, tips=0, angry=0)
+        self.customers = []
+        for tb in self.tables:
+            tb["cust"] = None
+        self.cust_timer = 10.0
         self.day += 1
         old = self.season_built
         self.ensure_season()
@@ -1298,17 +5017,17 @@ class Game:
                 self.eggs.append([random.randint(44 * TILE + 8, 52 * TILE - 8), random.randint(28 * TILE, 32 * TILE)])
         flowers = sum(1 for o in self.objs.values() if o["t"] == "flower")
         tries = 0
-        while flowers < 60 and tries < 40:
+        while flowers < 200 and tries < 40:
             tries += 1
             x, y = random.randrange(5, MAP_W - 5), random.randrange(4, MAP_H - 4)
             if (x, y) in self.reserved or (x, y) in self.objs or (x, y) in self.soil:
                 continue
             self.objs[(x, y)] = dict(t="flower", v=random.randrange(3))
             flowers += 1
-            if flowers > 40 and random.random() < 0.3:
+            if flowers > 120 and random.random() < 0.3:
                 break
         self.energy = self.max_energy * (0.6 if self.passed_out else 1.0)
-        self.water = 20
+        self.water = self.water_cap()
         self.time = WAKE_HOUR
         self.player.x, self.player.y = 30 * TILE, 10 * TILE + 10
         self.player.dir = "down"
@@ -1316,6 +5035,8 @@ class Game:
 
     # ------------------------------------------------------- update
     def ambient(self):
+        if self.location in ("cafe", "house"):
+            return (250, 232, 200)
         keys = [(5.0, (70, 76, 128)), (6.5, (220, 170, 160)), (8.0, (255, 250, 240)),
                 (16.5, (255, 248, 236)), (18.5, (255, 190, 140)), (20.0, (120, 110, 170)),
                 (21.5, (72, 80, 134)), (26.0, (52, 58, 108))]
@@ -1343,13 +5064,24 @@ class Game:
             self.start_end_day(True)
             return
         keys = pygame.key.get_pressed()
-        mx = int(keys[pygame.K_d] or keys[pygame.K_RIGHT] or pygame.K_RIGHT in self.touch_keys) - int(keys[pygame.K_a] or keys[pygame.K_LEFT] or pygame.K_LEFT in self.touch_keys)
-        my = int(keys[pygame.K_s] or keys[pygame.K_DOWN] or pygame.K_DOWN in self.touch_keys) - int(keys[pygame.K_w] or keys[pygame.K_UP] or pygame.K_UP in self.touch_keys)
+        mx = int(keys[pygame.K_d] or keys[pygame.K_RIGHT]) - int(keys[pygame.K_a] or keys[pygame.K_LEFT])
+        my = int(keys[pygame.K_s] or keys[pygame.K_DOWN]) - int(keys[pygame.K_w] or keys[pygame.K_UP])
+        touch_used, analog = False, 1.0
+        tv = self.touch.vec
+        if mx == 0 and my == 0 and (tv[0] or tv[1]):
+            mx, my = tv
+            touch_used = True
+            analog = min(1.0, math.hypot(mx, my))
         p.moving = False
         if p.act > 0:
             p.act -= dt
         elif mx or my:
-            if mx and not my:
+            if touch_used:
+                if abs(mx) > abs(my):
+                    p.dir = "right" if mx > 0 else "left"
+                else:
+                    p.dir = "down" if my > 0 else "up"
+            elif mx and not my:
                 p.dir = "right" if mx > 0 else "left"
             elif my and not mx:
                 p.dir = "down" if my > 0 else "up"
@@ -1357,8 +5089,8 @@ class Game:
                 p.dir = "down" if my > 0 else "up"
             elif p.dir in ("up", "down") and not my:
                 p.dir = "right" if mx > 0 else "left"
-            run = 1.55 if (keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT] or pygame.K_LSHIFT in self.touch_keys) else 1.0
-            sp = 62 * run * dt
+            run = 1.55 if (keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]) else 1.0
+            sp = 62 * run * dt * analog
             ln = math.hypot(mx, my)
             self.move_entity(p, mx / ln * sp, my / ln * sp)
             p.moving = True
@@ -1370,6 +5102,7 @@ class Game:
             if o.get("shake", 0) > 0:
                 o["shake"] -= dt
         self.update_actors(dt)
+        self.update_cafe(dt)
         self.update_effects(dt)
         for e in self.eggs[:]:
             if math.hypot(e[0] - p.x, e[1] - p.y) < 9:
@@ -1488,6 +5221,13 @@ class Game:
                         xx, yy = tx + nx, ty + ny
                         if 0 <= xx < MAP_W and 0 <= yy < MAP_H and self.tiles[yy][xx] != WATER:
                             surf_.fill((200, 230, 246), (dx + r[0], dy + r[1], r[2], r[3]))
+                elif tt == BRIDGE:
+                    row = 0 if ty == BRIDGE_ROWS[0] else 2 if ty == BRIDGE_ROWS[1] else 1
+                    surf_.blit(SPR["bridge"][row], (dx, dy))
+                elif tt == WOOD_FLOOR:
+                    surf_.blit(SPR["wood_floor"], (dx, dy))
+                elif tt == WALL:
+                    surf_.blit(SPR["wall"], (dx, dy))
                 elif tt == PATH:
                     surf_.blit(SPR["path"][h % 4], (dx, dy))
                 elif tt == SAND:
@@ -1523,10 +5263,18 @@ class Game:
             ents.append((c.y + 4, "chicken", c))
         for n in self.npcs:
             ents.append((n.y, "npc", n))
+        for rp in self.remote:
+            if rp.get("loc") == self.location and abs(rp["x"] - cx) < VIEW_W + 40 and abs(rp["y"] - cy) < VIEW_H + 40:
+                ents.append((rp["y"], "remote", rp))
+        for tb in self.active_tables():
+            ents.append(((tb["ty"] + 1) * TILE, "table", tb))
+        for cu in self.customers:
+            ents.append((cu.y + (4 if cu.state in ("wait", "eat") else 0), "cust", cu))
         ents.append((self.player.y, "player", self.player))
         ents.sort(key=lambda e: e[0])
         for _, kind, data in ents:
             self.draw_entity(surf_, kind, data, cx, cy)
+        self.draw_bubbles(surf_, cx, cy)
 
     def draw_entity(self, surf_, kind, d, cx, cy):
         t = self.t
@@ -1555,10 +5303,14 @@ class Game:
                 surf_.fill((255, 255, 255), (x * TILE - cx + 10, y * TILE - cy + 2, 2, 2))
         elif kind == "bld":
             b = d
-            if b["kind"] == "house":
+            if b["kind"] in ("house", "village_house", "village_house2", "village_house3", "player_villager_house",
+                             "port_house"):
                 bx, by = b["tx"] * TILE - cx, b["ty"] * TILE - cy
-                surf_.blit(SPR["house"], (bx, by))
-                self.window_glow(surf_, bx, by, SPR["house_windows"])
+                sprite_kind = {"player_villager_house": "player_house", "port_house": "village_house2"}.get(
+                    b["kind"], b["kind"])
+                surf_.blit(SPR[sprite_kind], (bx, by))
+                wins = SPR["house_windows"] if b["kind"] == "house" else SPR["village_windows"]
+                self.window_glow(surf_, bx, by, wins)
             elif b["kind"] == "kitchen":
                 bx, by = b["tx"] * TILE - cx, b["ty"] * TILE - cy
                 surf_.blit(SPR["kitchen"], (bx, by))
@@ -1574,6 +5326,22 @@ class Game:
                 surf_.blit(SPR["stall_back"], (b["tx"] * TILE - cx, b["ty"] * TILE - cy))
             elif b["kind"] == "coop":
                 surf_.blit(SPR["coop"], (b["tx"] * TILE - cx, b["ty"] * TILE - cy))
+            elif b["kind"] == "cafe":
+                bx, by = b["tx"] * TILE - cx, b["ty"] * TILE - cy
+                surf_.blit(SPR["cafe"], (bx, by))
+                self.window_glow(surf_, bx, by, [(12, 36, 24, 18), (92, 36, 24, 18)])
+            elif b["kind"] in ("stove", "register", "exitdoor", "bed", "computer", "bench", "dock", "dock_back", "port", "ruin", "village_port"):
+                surf_.blit(SPR["fur_" + b["kind"]], (b["tx"] * TILE - cx, b["ty"] * TILE - cy - 4))
+            elif b["kind"] == "pc":
+                bx, by = b["tx"] * TILE - cx, b["ty"] * TILE - cy - 16
+                surf_.blit(SPR["pc"], (bx, by))
+                if int(t * 2) % 2 == 0:
+                    surf_.fill((255, 255, 255), (bx + 18, by + 11, 2, 2))
+            elif b["kind"] == "arcade":
+                bx, by = b["tx"] * TILE - cx, b["ty"] * TILE - cy - 24
+                surf_.blit(SPR["arcade"], (bx, by))
+                col = ((250, 80, 120), (80, 220, 250), (250, 220, 80), (120, 250, 120))[int(t * 3) % 4]
+                surf_.fill(col, (bx + 8 + int(t * 10) % 14, by + 14, 3, 3))
         elif kind == "stall_front":
             surf_.blit(SPR["stall_front"], (d["tx"] * TILE - cx, d["ty"] * TILE - cy))
         elif kind == "lamp":
@@ -1596,8 +5364,28 @@ class Game:
             if n.wander:
                 surf_.blit(SPR["shadow"], (n.x - cx - 7, n.y - cy - 3))
             surf_.blit(n.sprites[(n.dir, fr)], (n.x - cx - 8, n.y - cy - 23 + bob))
+            mk = self.npc_marker(n.name)
+            mx_, my_ = int(n.x - cx), int(n.y - cy) - 38
+            if mk == "new":                                   # a quest on offer
+                pygame.draw.rect(surf_, GOLD, (mx_ - 1, my_, 3, 7))
+                pygame.draw.rect(surf_, GOLD, (mx_ - 1, my_ + 9, 3, 3))
+            elif mk == "done":                                # a quest ready to hand in
+                draw_star(surf_, mx_, my_ + 4, 5, GOLD)
         elif kind == "player":
             self.draw_player(surf_, d, cx, cy)
+        elif kind == "remote":
+            img = SPR["remote"].get((d.get("d", "down"), int(d.get("f", 0)) % 4), SPR["remote"][("down", 0)])
+            surf_.blit(SPR["shadow"], (d["x"] - cx - 7, d["y"] - cy - 3))
+            surf_.blit(img, (d["x"] - cx - 8, d["y"] - cy - 23))
+        elif kind == "table":
+            surf_.blit(SPR["table"], (d["tx"] * TILE - cx, d["ty"] * TILE - cy))
+        elif kind == "cust":
+            moving = d.state in ("arrive", "leave")
+            fr = int(d.anim) % 4 if moving else 0
+            bob = -1 if ((d.state == "eat" and int(t * 3) % 2 == 0) or fr in (1, 3)) else 0
+            if moving:
+                surf_.blit(SPR["shadow"], (d.x - cx - 7, d.y - cy - 3))
+            surf_.blit(d.sprites[(d.dir, fr)], (d.x - cx - 8, d.y - cy - 23 + bob))
 
     def window_glow(self, surf_, bx, by, wins):
         ln = self.night_level()
@@ -1652,7 +5440,7 @@ class Game:
 
     def draw_critters(self, surf_):
         ln = self.night_level()
-        if self.rain:
+        if self.rain or self.location != "farm":
             return
         for c in self.crit:
             x, y = int(c["x"]), int(c["y"])
@@ -1685,6 +5473,10 @@ class Game:
             light(27 * TILE + 71, 5 * TILE + 54, "glow_m")
             light(36 * TILE + 22, 8 * TILE + 35, "glow_m")
             light(self.player.x, self.player.y - 10, "glow_m")
+            light(38 * TILE + 24, 15 * TILE + 45, "glow_m")
+            light(38 * TILE + 104, 15 * TILE + 45, "glow_m")
+            light(57 * TILE + 16, 17 * TILE - 6, "glow_m")
+            light(33 * TILE + 16, 9 * TILE - 6, "glow_s")
             if ln > 0.45 and not self.rain:
                 for c in self.crit:
                     if math.sin(self.t * 3 + c["ph"]) > 0.25:
@@ -1694,7 +5486,7 @@ class Game:
         surf_.blit(dark, (0, 0), special_flags=pygame.BLEND_RGB_MULT)
 
     def draw_rain(self, surf_):
-        if not self.rain:
+        if not self.rain or self.location != "farm":
             return
         for d in self.rain_drops:
             pygame.draw.line(surf_, (190, 210, 240), (d[0], d[1]), (d[0] - 2, d[1] + 5))
@@ -1731,6 +5523,8 @@ class Game:
         self.screen.blit(img, pos)
 
     def draw_hud(self, cam):
+        if NO_HUD:
+            return self.draw_minimal_hud(cam)
         scr = self.screen
         p = self.player
         # clock panel
@@ -1754,6 +5548,7 @@ class Game:
                                  (wx + math.cos(a) * 17, wy + 6 + math.sin(a) * 17), 2)
         self.icon("coin", (r.x + 12, r.y + 78), 1)
         self.text("%sg" % format(self.money, ","), (r.x + 34, r.y + 77), self.f_m, TEXT)
+        self.draw_cafe_stars()
         # energy bar
         er = pygame.Rect(WIN_W - 46, WIN_H - 168, 34, 156)
         self.panel(er)
@@ -1771,8 +5566,10 @@ class Game:
         size, gap = 50, 4
         total = n * (size + gap) - gap
         x0, y0 = WIN_W // 2 - total // 2, WIN_H - size - 16
+        self.hotbar_rects = []
         for i, k in enumerate(keys):
             rr = pygame.Rect(x0 + i * (size + gap), y0, size, size)
+            self.hotbar_rects.append((rr, i))
             sel = i == self.sel
             pygame.draw.rect(scr, INK, rr.inflate(6, 6), border_radius=8)
             pygame.draw.rect(scr, GOLD if sel else PANEL_D, rr.inflate(2, 2), border_radius=7)
@@ -1784,7 +5581,7 @@ class Game:
                 self.text(self.inv.get(k, 0), (rr.right - 4, rr.bottom - 16), self.f_s, TEXT, right=True)
             elif k == "can":
                 pygame.draw.rect(scr, (70, 50, 40), (rr.x + 6, rr.bottom - 8, size - 12, 4))
-                pygame.draw.rect(scr, (90, 160, 230), (rr.x + 6, rr.bottom - 8, int((size - 12) * self.water / 20), 4))
+                pygame.draw.rect(scr, (90, 160, 230), (rr.x + 6, rr.bottom - 8, int((size - 12) * self.water / self.water_cap()), 4))
         if keys:
             nm = ITEMS[keys[self.sel]]["name"]
             if self.sel_timer > 0 or True:
@@ -1792,7 +5589,7 @@ class Game:
         # toasts
         for i, tdict in enumerate(reversed(self.toasts)):
             a = clamp(tdict["t"] / 0.5, 0, 1)
-            tr = pygame.Rect(14, WIN_H - 92 - i * 40, 330, 32)
+            tr = pygame.Rect(14, WIN_H - 124 - i * 40, 330, 32)
             ps = pygame.Surface((tr.w, tr.h), pygame.SRCALPHA)
             pygame.draw.rect(ps, (60, 40, 30, int(210 * a)), ps.get_rect(), border_radius=8)
             scr.blit(ps, tr)
@@ -1813,12 +5610,29 @@ class Game:
             pygame.draw.rect(scr, PANEL_L, rr, border_radius=7)
             self.text(pt, rr.center, self.f_s, TEXT, center=True)
 
+    def draw_minimal_hud(self, cam):
+        """No-HUD mode: only interaction prompts and short messages on screen."""
+        pt = self.prompt_text()
+        if pt and self.state == "play":
+            p = self.player
+            sx, sy = (p.x - cam[0]) * SCALE, (p.y - 38 - cam[1]) * SCALE
+            w = self.f_s.size(pt)[0] + 20
+            rr = pygame.Rect(sx - w // 2, sy - 22, w, 26)
+            pygame.draw.rect(self.screen, INK, rr.inflate(4, 4), border_radius=8)
+            pygame.draw.rect(self.screen, PANEL_L, rr, border_radius=7)
+            self.text(pt, rr.center, self.f_s, TEXT, center=True)
+        for i, tdict in enumerate(reversed(self.toasts)):
+            a = clamp(tdict["t"] / 0.5, 0, 1)
+            img = self.f_s.render(tdict["text"], True, CREAM)
+            img.set_alpha(int(255 * a))
+            self.screen.blit(img, (WIN_W // 2 - img.get_width() // 2, WIN_H - 40 - i * 22))
+
     # ------------------------------------------------------- menus
     def list_for(self, kind):
         if kind == "shop":
             return [k + "_seed" for k in CROPS]
         if kind == "cook":
-            return list(RECIPES)
+            return list(self.unlocked)
         if kind == "bin":
             return [k for k in ITEMS if self.inv.get(k, 0) > 0 and ITEMS[k]["kind"] != "tool" and ITEMS[k]["sell"] > 0]
         if kind == "inv":
@@ -1831,6 +5645,27 @@ class Game:
         shade = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
         shade.fill((20, 12, 8, 140))
         self.screen.blit(shade, (0, 0))
+        if ty == "pc":
+            self.draw_pc()
+            return
+        if ty == "cafe":
+            self.draw_cafe_menu()
+            return
+        if ty == "arcade":
+            self.draw_arcade_menu()
+            return
+        if ty == "bench":
+            self.draw_bench()
+            return
+        if ty == "admin":
+            self.draw_admin_menu()
+            return
+        if ty == "fishmaster":
+            self.draw_fishmaster()
+            return
+        if ty == "journal":
+            self.draw_journal()
+            return
         if ty == "sleep":
             r = pygame.Rect(WIN_W // 2 - 220, WIN_H // 2 - 90, 440, 180)
             self.panel(r)
@@ -1842,11 +5677,15 @@ class Game:
                 self.text(lab, rr.center, self.f_m, TEXT, center=True)
             return
         if ty == "pause":
-            r = pygame.Rect(WIN_W // 2 - 200, WIN_H // 2 - 130, 400, 260)
+            items = self.pause_items()
+            r = pygame.Rect(WIN_W // 2 - 200, WIN_H // 2 - 165, 400, 120 + len(items) * 38)
             self.panel(r)
             self.text("Paused", (r.centerx, r.y + 22), self.f_l, TEXT, center=True)
-            for i, lab in enumerate(("Resume", "Save game", "Save and quit to title", "Help")):
-                rr = pygame.Rect(r.x + 30, r.y + 80 + i * 40, 340, 34)
+            status = ("Room at %s:%d - %d / %d players" % (lan_ip(), NET_PORT, len(self.net_server.clients) + 1, ROOM_SIZE)) if self.net_server else (
+                "Connected to a LAN game" if self.net_client else "Not in a LAN game")
+            self.text(status, (r.centerx, r.y + 58), self.f_s, PANEL_D, center=True)
+            for i, lab in enumerate(items):
+                rr = pygame.Rect(r.x + 30, r.y + 84 + i * 38, 340, 32)
                 if m["idx"] == i:
                     pygame.draw.rect(self.screen, GOLD, rr, border_radius=6)
                 self.text(lab, rr.center, self.f_m, TEXT, center=True)
@@ -1868,6 +5707,9 @@ class Game:
             self.text("Pick a recipe and press Enter", (r.x + 24, r.y + 56), self.f_s, PANEL_D)
         if ty == "inv":
             self.text("Enter: eat food", (r.x + 24, r.y + 56), self.f_s, PANEL_D)
+            self.text("Farming Lv %d   Cooking Lv %d   Fishing Lv %d   Cafe %d stars" % (
+                self.level("farm"), self.level("cook"), self.level("fish"), self.stars()),
+                (r.right - 24, r.y + 60), self.f_s, TEXT, right=True)
         if not entries:
             self.text("Nothing here yet.", (r.centerx, r.centery), self.f_m, PANEL_D, center=True)
         rows, row_h = 7, 52
@@ -1910,7 +5752,7 @@ class Game:
                 extra = "+%d energy   " % it["energy"] if it["kind"] == "food" else ""
                 self.text("%sx%d" % (extra, self.inv.get(k, 0)), (rr.right - 14, rr.y + 14), self.f_s, TEXT, right=True)
         hint = {"shop": "Enter: buy 1   Shift+Enter: buy 5   Esc: leave",
-                "cook": "Enter: cook   Esc: leave",
+                "cook": "Enter: start cooking   Esc: leave",
                 "bin": "Enter: ship 1   Shift+Enter: ship all   Esc: leave",
                 "inv": "Enter: eat   I / Esc: close"}[ty]
         self.text(hint, (r.centerx, r.bottom - 26), self.f_s, PANEL_D, center=True)
@@ -1924,6 +5766,9 @@ class Game:
         ok = k in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_KP_ENTER)
         shift = ev.mod & pygame.KMOD_SHIFT
         close = k == pygame.K_ESCAPE or (k in (pygame.K_i, pygame.K_TAB) and ty == "inv")
+        if ty in ("pc", "cafe", "arcade", "bench", "admin", "journal", "fishmaster"):
+            self.extra_menu_key(ev, ty)
+            return
         if ty == "sleep":
             if up or down:
                 m["idx"] = 1 - m["idx"]
@@ -1934,24 +5779,36 @@ class Game:
                 self.state, self.menu = "play", {}
             return
         if ty == "pause":
+            n = len(self.pause_items())
             if up:
-                m["idx"] = (m["idx"] - 1) % 4
+                m["idx"] = (m["idx"] - 1) % n
             elif down:
-                m["idx"] = (m["idx"] + 1) % 4
+                m["idx"] = (m["idx"] + 1) % n
             elif close:
                 self.state, self.menu = "play", {}
             elif ok:
-                i = m["idx"]
-                if i == 0:
-                    self.state, self.menu = "play", {}
-                elif i == 1:
+                item = self.pause_items()[m["idx"]]
+                if item == "Save game":
                     self.toast("Game saved!" if self.save_game() else "Could not save the game.")
                     self.state, self.menu = "play", {}
-                elif i == 2:
+                elif item == "Save and quit to title":
                     self.save_game()
+                    self.net_close()
                     self.state, self.menu = "title", {}
-                else:
+                elif item == "Help":
                     self.state, self.menu = "help", {}
+                elif item == "Fish journal":
+                    self.menu = dict(type="journal", idx=0, scroll=0)
+                elif item == "Host LAN game":
+                    self.start_hosting()
+                    self.state, self.menu = "play", {}
+                elif item == "Stop hosting":
+                    self.stop_hosting()
+                    self.state, self.menu = "play", {}
+                elif item == "Admin panel":
+                    self.menu = dict(type="admin", idx=0, scroll=0)
+                else:
+                    self.state, self.menu = "play", {}
             return
         entries = self.list_for(ty)
         if close:
@@ -1972,18 +5829,13 @@ class Game:
                 else:
                     self.toast("Not enough gold!")
             elif ty == "cook":
-                rec = RECIPES[key]
-                if all(self.inv.get(i, 0) >= n for i, n in rec["needs"].items()):
-                    for i, n in rec["needs"].items():
-                        self.take_item(i, n)
-                    self.add_item(key)
-                    self.sparkle(36 * TILE + 30, 10 * TILE, 8)
-                else:
-                    self.toast("You're missing some ingredients.")
+                self.start_cook(key)
+                return
             elif ty == "bin":
                 n = self.inv.get(key, 0) if shift else 1
                 self.take_item(key, n)
                 self.bin[key] = self.bin.get(key, 0) + n
+                self.qinc("ship", n)
             elif ty == "inv":
                 if ITEMS[key]["kind"] == "food":
                     if self.energy >= self.max_energy - 1:
@@ -1996,17 +5848,82 @@ class Game:
         d = self.dialog
         r = pygame.Rect(60, WIN_H - 190, WIN_W - 120, 150)
         self.panel(r)
-        self.text(d["name"], (r.x + 24, r.y + 14), self.f_m, (140, 70, 40))
+        pic = d.get("portrait")
+        left = r.x + 24
+        width = r.w - 60
+        if pic is not None:
+            self.screen.blit(pic, (r.x + 14, r.y + (r.h - pic.get_height()) // 2))
+            left = r.x + 130
+            width -= 106
+        self.text(d["name"], (left, r.y + 14), self.f_m, (140, 70, 40))
         shown = int(d["shown"])
         words, line, y = d["text"][:shown].split(" "), "", r.y + 50
         for w in words:
-            if self.f_m.size(line + w)[0] > r.w - 60:
-                self.text(line, (r.x + 24, y), self.f_m, TEXT)
+            if self.f_m.size(line + w)[0] > width:
+                self.text(line, (left, y), self.f_m, TEXT)
                 line, y = "", y + 30
             line += w + " "
-        self.text(line, (r.x + 24, y), self.f_m, TEXT)
+        self.text(line, (left, y), self.f_m, TEXT)
         if shown >= len(d["text"]):
             self.text("Press E", (r.right - 24, r.bottom - 30), self.f_s, PANEL_D, right=True)
+
+    def draw_wish(self):
+        scr = self.screen
+        ov = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+        ov.fill((24, 14, 10, 165))
+        scr.blit(ov, (0, 0))
+        r = pygame.Rect(WIN_W // 2 - 300, 100, 600, 500)
+        self.panel(r)
+        self.text("Make a wish!", (r.centerx, r.y + 18), self.f_l, TEXT, center=True)
+        self.text("Crazy Dew will grant one wish. Each wish can only be made once.", (r.centerx, r.y + 56),
+                  self.f_s, PANEL_D, center=True)
+        y = r.y + 96
+        for i, (key, title, desc) in enumerate(self.wish_opts):
+            row = pygame.Rect(r.x + 24, y, r.w - 48, 46)
+            pygame.draw.rect(scr, (255, 226, 150) if i == self.wish_idx else (255, 246, 226), row, border_radius=8)
+            pygame.draw.rect(scr, INK, row, 2, border_radius=8)
+            self.text(title, (row.x + 14, row.y + 4), self.f_m, TEXT)
+            self.text(desc, (row.x + 14, row.y + 26), self.f_s, PANEL_D)
+            y += 54
+        self.text("Up / Down to choose, Enter to wish", (r.centerx, r.bottom - 26), self.f_s, PANEL_D, center=True)
+
+    def wish_key(self, ev):
+        k = ev.key
+        opts = self.wish_opts
+        if not opts:
+            self.state = "play"
+            return
+        if k in (pygame.K_UP, pygame.K_w):
+            self.wish_idx = (self.wish_idx - 1) % len(opts)
+        elif k in (pygame.K_DOWN, pygame.K_s):
+            self.wish_idx = (self.wish_idx + 1) % len(opts)
+        elif k in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_e, pygame.K_KP_ENTER):
+            key, title, _ = opts[self.wish_idx]
+            self.apply_wish(key)
+            self.wishes_done.add(key)
+            self.wish_opts = []
+            self.state = "play"
+
+    def apply_wish(self, key):
+        if key == "gold":
+            self.money += 1500
+        elif key == "stamina":
+            self.max_energy += 40
+            self.energy = float(self.max_energy)
+        elif key == "recipes":
+            self.unlocked = list(dict.fromkeys(self.unlocked + list(RECIPE_PRICE)))
+        elif key == "seeds":
+            for k in CROPS:
+                self.add_item(k + "_seed", 5, quiet=True)
+        elif key == "rare":
+            self.add_item("rare_fish", 5, quiet=True)
+        elif key == "kits":
+            self.add_item("villager_house_kit", 2, quiet=True)
+        elif key == "skills":
+            for skill in ("farm", "cook", "fish"):
+                self.gain_xp(skill, 200)
+        title = next(t for k, t, _ in WISH_OPTIONS if k == key)
+        self.toast("Wish granted: %s!" % title, "coin")
 
     def draw_help(self):
         shade = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
@@ -2027,9 +5944,16 @@ class Game:
             ("2. Water daily", "Crops only grow on watered days"),
             ("3. Harvest (E)", "then cook at the teal Kitchen hut"),
             ("4. Ship goods", "in the wooden bin by your house"),
-            ("5. Shop east", "Mabel sells seeds in the village"),
-            ("6. Sleep", "in your house before 2am!"),
+            ("5. Cafe", "Serve guests at the tables (E)"),
+            ("6. PC + sleep", "PC: shop online. Sleep before 2am!"),
         ]
+        if ANDROID:
+            lines[:6] = [("Left thumb", "Drag on the left side to move"),
+                         ("USE", "Use tool, plant seeds, eat food"),
+                         ("E", "Interact: harvest, cook, shop, sleep"),
+                         ("< >  or tap", "Change hotbar slot (or tap a slot)"),
+                         ("BAG", "Backpack"),
+                         ("MENU", "Pause and save")]
         for i, (a, b) in enumerate(lines):
             self.text(a, (r.x + 40, r.y + 76 + i * 30), self.f_m, (140, 70, 40))
             self.text(b, (r.x + 250, r.y + 76 + i * 30), self.f_m, TEXT)
@@ -2046,11 +5970,21 @@ class Game:
         y = r.y + 94
         if not s["lines"]:
             self.text("Nothing was shipped today.", (r.centerx, y + 20), self.f_m, PANEL_D, center=True)
-        for k, n, v in s["lines"][:8]:
+        for k, n, v in s["lines"][:6]:
             self.icon(k, (r.x + 30, y), 2)
             self.text("%s x%d" % (ITEMS[k]["name"], n), (r.x + 74, y + 8), self.f_m, TEXT)
             self.text("%dg" % v, (r.right - 30, y + 8), self.f_m, TEXT, right=True)
             y += 36
+        if not s["lines"]:
+            y += 44
+        cf = s.get("cafe")
+        if cf and (cf["served"] or cf["angry"]):
+            self.text("Cafe: %d served, %dg earned (tips %dg), %d unhappy" % (cf["served"], cf["earned"], cf["tips"], cf["angry"]),
+                      (r.centerx, y + 8), self.f_s, TEXT, center=True)
+            y += 28
+        if s.get("deliveries"):
+            names = ", ".join("%d %s" % (n, ITEMS[k]["name"]) for k, n in s["deliveries"][:4])
+            self.text("Delivered: " + names, (r.centerx, y + 8), self.f_s, TEXT, center=True)
         self.text("Earned: %dg" % s["earned"], (r.centerx, r.bottom - 100), self.f_l, (60, 120, 50), center=True)
         self.text("You now have %sg" % format(self.money, ","), (r.centerx, r.bottom - 64), self.f_m, TEXT, center=True)
         self.text("Press Enter for the next day", (r.centerx, r.bottom - 30), self.f_s, PANEL_D, center=True)
@@ -2058,8 +5992,7 @@ class Game:
     def draw_title(self):
         self.t += 0
         px = 27 * TILE + 48
-        cam = (clamp(int(px - VIEW_W / 2 + math.sin(self.t * 0.15) * 70), 0, MAP_W * TILE - VIEW_W),
-               clamp(int(5 * TILE - 40 + math.sin(self.t * 0.1) * 20), 0, MAP_H * TILE - VIEW_H))
+        cam = (clamp(int(px - VIEW_W / 2 + math.sin(self.t * 0.15) * 70), 0, MAP_W * TILE - VIEW_W),               clamp(int(5 * TILE - 40 + math.sin(self.t * 0.1) * 20), 0, MAP_H * TILE - VIEW_H))
         self.render_scene(cam, hud=False)
         shade = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
         shade.fill((30, 18, 10, 90))
@@ -2067,28 +6000,175 @@ class Game:
         bob = math.sin(self.t * 1.5) * 4
         self.text("A Game About", (WIN_W // 2, 60 + bob), self.f_l, CREAM, shadow=INK, center=True)
         self.text("Farming and Cooking", (WIN_W // 2, 96 + bob), self.f_xl, GOLD, shadow=INK, center=True)
-        opts = (["Continue"] if self.has_save() else []) + ["New Game", "Quit"]
+        opts = self.title_options()
         self.title_idx = clamp(self.title_idx, 0, len(opts) - 1)
+        save_exists = self.has_save()
         for i, o in enumerate(opts):
-            rr = pygame.Rect(WIN_W // 2 - 140, 380 + i * 54, 280, 44)
-            self.panel(rr, (252, 224, 150) if i == self.title_idx else PANEL)
-            self.text(o, rr.center, self.f_m, TEXT, center=True)
-        self.text("Up/Down + Enter", (WIN_W // 2, WIN_H - 28), self.f_s, CREAM, shadow=INK, center=True)
+            rr = pygame.Rect(WIN_W // 2 - 160, 360 + i * 54, 320, 44)
+            selected = i == self.title_idx
+            self.panel(rr, (252, 224, 150) if selected else PANEL)
+            label_color = TEXT if (o != "Continue Playing" or save_exists) else (135, 125, 110)
+            self.text(o, rr.center, self.f_m, label_color, center=True)
+        if not save_exists:
+            self.text("No save file yet", (WIN_W // 2, 360 + 44 + 8), self.f_s, CREAM, shadow=INK, center=True)
+        self.text("Up/Down + Enter, or tap", (WIN_W // 2, WIN_H - 28), self.f_s, CREAM, shadow=INK, center=True)
+
+    def join_key(self, ev):
+        k = ev.key
+        if k == pygame.K_ESCAPE:
+            self.state = "title"
+            return
+        if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            self.join_connect(self.join_text.strip())
+            return
+        if k == pygame.K_BACKSPACE:
+            self.join_text = self.join_text[:-1]
+            return
+        ch = getattr(ev, "unicode", "") or ""
+        if ch and ch in "0123456789." and len(self.join_text) < 21:
+            self.join_text += ch
+
+    def join_connect(self, ip):
+        try:
+            self.net_client = NetClient(ip)
+        except ServerFull as e:
+            self.join_msg = str(e)
+            return
+        except (OSError, ValueError):
+            self.join_msg = "Could not reach %s. Same WiFi? Is the host playing?" % ip
+            return
+        self.new_game()
+        self.state = "play"
+        self.toast("Joined the LAN game at %s" % ip)
+
+    def draw_join(self):
+        self.render_scene((0, 0), hud=False)
+        shade = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+        shade.fill((30, 18, 10, 120))
+        self.screen.blit(shade, (0, 0))
+        r = pygame.Rect(WIN_W // 2 - 270, WIN_H // 2 - 150, 540, 300)
+        self.panel(r)
+        self.text("Join a LAN game", (r.centerx, r.y + 20), self.f_l, TEXT, center=True)
+        self.text("Type the host's IP address (shown when they host).", (r.centerx, r.y + 70), self.f_s, PANEL_D, center=True)
+        self.text("Both devices must be on the same WiFi.", (r.centerx, r.y + 92), self.f_s, PANEL_D, center=True)
+        box = pygame.Rect(r.x + 40, r.y + 124, r.w - 80, 44)
+        pygame.draw.rect(self.screen, (252, 224, 150), box, border_radius=8)
+        pygame.draw.rect(self.screen, TEXT, box, 2, border_radius=8)
+        cursor = "_" if int(self.t * 2) % 2 == 0 else " "
+        self.text(self.join_text + cursor, (box.x + 14, box.y + 10), self.f_m, TEXT)
+        if self.join_msg:
+            self.text(self.join_msg, (r.centerx, r.y + 190), self.f_s, (150, 40, 30), center=True)
+        self.text("Enter: connect     Backspace: erase     Esc: back", (r.centerx, r.bottom - 30), self.f_s, PANEL_D, center=True)
+
+    # ------------------------------------------------------- LAN multiplayer
+    def net_state(self):
+        p = self.player
+        return dict(name=self.player_name, x=int(p.x), y=int(p.y), d=p.dir,
+                    f=int(p.anim) % 4 if p.moving else 0, loc=self.location)
+
+    def net_tick(self, dt):
+        if not (self.net_server or self.net_client):
+            return
+        self.net_timer = getattr(self, "net_timer", 0.0) - dt
+        if self.net_timer > 0:
+            return
+        crowd = self.net_server is not None and len(self.net_server.clients) > 40
+        self.net_timer = 0.2 if crowd else 0.1
+        st = self.net_state()
+        if self.net_client and self.net_client.kicked:
+            self.toast("The host removed you from the LAN game.")
+            self.net_client.close()
+            self.net_client = None
+            self.remote = []
+            return
+        if self.net_client and not self.net_client.alive:
+            self.toast("Lost the connection to the LAN game.")
+            self.net_client.close()
+            self.net_client = None
+            self.remote = []
+            return
+        if self.net_server:
+            self.net_server.broadcast(st)
+            self.remote = [p for p in self.net_server.snapshot if p.get("id") != 0]
+        if self.net_client:
+            self.net_client.send_state(st)
+            me = self.net_client.my_id
+            self.remote = [p for p in self.net_client.players if p.get("id") != me]
+
+    def start_hosting(self):
+        if not CAN_HOST:
+            self.toast("This is the player version. You can only join games.")
+            return
+        if self.net_server:
+            return
+        if self.net_client:
+            self.toast("You are already in someone else's LAN game.")
+            return
+        try:
+            self.net_server = NetServer()
+        except OSError:
+            self.toast("Could not open port %d. Is another game hosting?" % NET_PORT)
+            return
+        self.toast("Room open at %s:%d (up to %d players)" % (lan_ip(), NET_PORT, ROOM_SIZE))
+
+    def stop_hosting(self):
+        if self.net_server:
+            self.net_server.close()
+            self.net_server = None
+            self.toast("Stopped hosting.")
+        self.remote = []
+
+    def net_close(self):
+        self.stop_hosting()
+        if self.net_client:
+            self.net_client.close()
+            self.net_client = None
+        self.remote = []
+
+    def draw_remote_names(self, cam):
+        for rp in self.remote:
+            if rp.get("loc") != self.location:
+                continue
+            if abs(rp["x"] - cam[0]) > VIEW_W + 40 or abs(rp["y"] - cam[1]) > VIEW_H + 40:
+                continue
+            sx = (rp["x"] - cam[0]) * SCALE
+            sy = (rp["y"] - 34 - cam[1]) * SCALE
+            self.text(rp.get("name", "?"), (sx, sy), self.f_s, (255, 255, 255), shadow=INK, center=True)
+
+    def title_options(self):
+        # Always show Continue Playing so players know where saved games are resumed.
+        return ["Continue Playing", "New Game", "Join LAN game", "Quit"]
+
+    def title_click(self, x, y):
+        for i, o in enumerate(self.title_options()):
+            if pygame.Rect(WIN_W // 2 - 160, 360 + i * 54, 320, 44).collidepoint(x, y):
+                self.title_idx = i
+                self.title_key(_Key(pygame.K_RETURN))
+                return True
+        return False
 
     def title_key(self, ev):
-        opts = (["Continue"] if self.has_save() else []) + ["New Game", "Quit"]
+        opts = self.title_options()
         if ev.key in (pygame.K_UP, pygame.K_w):
             self.title_idx = (self.title_idx - 1) % len(opts)
         elif ev.key in (pygame.K_DOWN, pygame.K_s):
             self.title_idx = (self.title_idx + 1) % len(opts)
         elif ev.key in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_KP_ENTER):
             o = opts[self.title_idx]
-            if o == "Continue":
+            if o == "Continue Playing":
                 if self.load_game():
                     self.state = "play"
+                    self.menu = {}
+                    self.toast("Save loaded! Welcome back.")
+                else:
+                    self.toast("No save file found. Start a New Game first.")
             elif o == "New Game":
                 self.new_game()
                 self.state = "help"
+            elif o == "Join LAN game":
+                self.join_text, self.join_msg = "192.168.", ""
+                self.state = "join"
+                getattr(pygame.key, "start_text_input", lambda: None)()
             else:
                 pygame.quit()
                 sys.exit()
@@ -2101,6 +6181,8 @@ class Game:
         self.draw_lighting(self.view, cam)
         self.draw_rain(self.view)
         pygame.transform.scale(self.view, (WIN_W, WIN_H), self.screen)
+        if self.state == "play" or self.state == "fishing":
+            self.draw_remote_names(cam)
         if hud:
             self.draw_hud(cam)
 
@@ -2108,8 +6190,12 @@ class Game:
         st = self.state
         if st == "title":
             self.draw_title()
+        elif st == "join":
+            self.draw_join()
         elif st == "summary":
             self.draw_summary()
+        elif st in ("mini", "mini_over"):
+            self.draw_mini()
         else:
             cam = self.camera()
             self.render_scene(cam)
@@ -2119,115 +6205,30 @@ class Game:
                 self.draw_dialog()
             elif st == "help":
                 self.draw_help()
-            if st in ("fade_out", "fade_in"):
+            elif st == "fishing":
+                self.draw_fishing()
+            elif st == "place":
+                self.draw_placing()
+            elif st == "cookgame":
+                self.draw_cookgame()
+            elif st == "journal":
+                self.draw_journal()
+            elif st == "wish":
+                self.draw_wish()
+            if st in ("fade_out", "fade_in", "warp"):
                 ov = pygame.Surface((WIN_W, WIN_H))
                 ov.fill((10, 8, 14))
                 ov.set_alpha(int(255 * clamp(self.fade, 0, 1)))
                 self.screen.blit(ov, (0, 0))
-        if st == "play":
-            self.draw_touch_controls()
-
-    def draw_touch_controls(self):
-        """Translucent mobile controls, drawn over the existing game without assets."""
-        overlay = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
-        cx, cy, r = 112, WIN_H - 116, 66
-        pygame.draw.circle(overlay, (20, 26, 24, 105), (cx, cy), r + 8)
-        pygame.draw.circle(overlay, (235, 235, 210, 105), (cx, cy), r, 3)
-        vx, vy = self.joystick_vector
-        knob = (int(cx + vx * 37), int(cy + vy * 37))
-        pygame.draw.circle(overlay, (245, 222, 164, 175), knob, 27)
-        buttons = [
-            (WIN_W - 105, WIN_H - 105, 43, "USE"),
-            (WIN_W - 210, WIN_H - 175, 39, "TALK"),
-            (WIN_W - 235, WIN_H - 75, 31, "RUN"),
-            (WIN_W - 65, 68, 27, "BAG"),
-        ]
-        for x, y, radius, label in buttons:
-            pressed = label.lower() in self.touch_buttons.values()
-            fill = (255, 211, 116, 205) if pressed else (35, 43, 38, 145)
-            pygame.draw.circle(overlay, fill, (x, y), radius)
-            pygame.draw.circle(overlay, (255, 242, 205, 200), (x, y), radius, 2)
-            surf = self.f_s.render(label, True, (255, 250, 225))
-            overlay.blit(surf, surf.get_rect(center=(x, y)))
-        self.screen.blit(overlay, (0, 0))
-
-    def touch_position(self, ev):
-        return (int(ev.x * WIN_W), int(ev.y * WIN_H))
-
-    def handle_touch_down(self, ev):
-        pos = self.touch_position(ev)
-        x, y = pos
-        self.last_touch_time = pygame.time.get_ticks()
-        if self.state != "play":
-            # Let the game menus respond to a tap as a click/confirm.
-            self.handle_tap_outside_play(pos)
-            return
-        jx, jy, jr = 112, WIN_H - 116, 76
-        if math.hypot(x - jx, y - jy) <= jr + 10 and self.joystick_finger is None:
-            self.joystick_finger = ev.finger_id
-            self.update_joystick(pos)
-            return
-        targets = [
-            (WIN_W - 105, WIN_H - 105, 48, "use"),
-            (WIN_W - 210, WIN_H - 175, 44, "interact"),
-            (WIN_W - 235, WIN_H - 75, 37, "run"),
-            (WIN_W - 65, 68, 32, "inventory"),
-        ]
-        for bx, by, br, action in targets:
-            if math.hypot(x - bx, y - by) <= br:
-                self.touch_buttons[ev.finger_id] = action
-                if action == "use": self.use_item()
-                elif action == "interact": self.interact()
-                elif action == "run": self.touch_keys.add(pygame.K_LSHIFT)
-                elif action == "inventory":
-                    self.menu = dict(type="inv", idx=0, scroll=0)
-                    self.state = "menu"
-                return
-
-    def update_joystick(self, pos):
-        dx, dy = pos[0] - 112, pos[1] - (WIN_H - 116)
-        length = math.hypot(dx, dy)
-        if length > 66:
-            dx, dy = dx * 66 / length, dy * 66 / length
-            length = 66
-        vx, vy = dx / 66, dy / 66
-        self.joystick_vector = (vx, vy)
-        dead = 0.28
-        self.touch_keys.difference_update((pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN))
-        if abs(vx) > dead: self.touch_keys.add(pygame.K_RIGHT if vx > 0 else pygame.K_LEFT)
-        if abs(vy) > dead: self.touch_keys.add(pygame.K_DOWN if vy > 0 else pygame.K_UP)
-
-    def handle_tap_outside_play(self, pos):
-        x, y = pos
-        if self.state == "title":
-            opts = ( ["Continue"] if self.has_save() else [] ) + ["New Game", "Quit"]
-            for i, option in enumerate(opts):
-                rect = pygame.Rect(WIN_W // 2 - 140, 380 + i * 54, 280, 44)
-                if rect.collidepoint(x, y):
-                    if option == "Continue":
-                        if self.load_game(): self.state = "play"
-                    elif option == "New Game":
-                        self.new_game(); self.state = "help"
-                    else:
-                        pygame.quit(); sys.exit()
-                    return
-            self.title_idx = min(len(opts) - 1, max(0, (y - 380) // 54))
-        elif self.state == "help":
-            self.state = "play"
-        elif self.state == "dialog":
-            d = self.dialog
-            if int(d["shown"]) < len(d["text"]): d["shown"] = len(d["text"])
-            else: self.state, self.dialog = "play", None
-        elif self.state == "summary":
-            self.state = "fade_in"; self.fade = 1.0
-        elif self.state == "menu":
-            self.menu_key(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_ESCAPE))
 
     def update(self, dt):
         self.t += dt
+        self.net_tick(dt)
         st = self.state
         if st == "play":
             self.update_play(dt)
+        elif st == "cookgame":
+            self.update_cookgame(dt)
         elif st == "dialog":
             self.dialog["shown"] += dt * 55
             self.update_effects(dt)
@@ -2244,12 +6245,28 @@ class Game:
                 self.state = "play"
         elif st == "title":
             self.update_effects(dt)
+        elif st == "place":
+            self.placing_update(dt)
+            self.update_effects(dt)
+        elif st == "warp":
+            self.update_warp(dt)
+        elif st == "fishing":
+            self.update_fishing(dt)
+            self.update_effects(dt)
+        elif st == "mini":
+            self.update_mini(dt)
+
+    def key_up(self, ev):
+        if self.state == "fishing" and ev.key in (pygame.K_SPACE, pygame.K_RETURN, pygame.K_e, pygame.K_KP_ENTER):
+            self.fishing_up()
 
     def key_down(self, ev):
         k = ev.key
         st = self.state
         if st == "title":
             self.title_key(ev)
+        elif st == "join":
+            self.join_key(ev)
         elif st == "help":
             self.state = "play"
         elif st == "menu":
@@ -2259,7 +6276,8 @@ class Game:
             if int(d["shown"]) < len(d["text"]):
                 d["shown"] = len(d["text"])
             elif k in (pygame.K_e, pygame.K_SPACE, pygame.K_RETURN, pygame.K_ESCAPE):
-                self.state, self.dialog = "play", None
+                self.state, self.dialog = (self.after_dialog or "play"), None
+                self.after_dialog = None
         elif st == "summary":
             if k in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_KP_ENTER):
                 self.state = "fade_in"
@@ -2268,6 +6286,26 @@ class Game:
                     self.toast("It's raining today. Your crops are watered!")
                 if getattr(self, "new_season", False):
                     self.toast("A new season begins: %s" % self.season)
+        elif st == "fishing":
+            if k == pygame.K_ESCAPE:
+                self.end_fishing()
+            elif k in (pygame.K_SPACE, pygame.K_RETURN, pygame.K_e):
+                self.fishing_down()
+        elif st == "place":
+            self.placing_key(ev)
+        elif st == "mini":
+            self.mini_key(ev)
+        elif st == "cookgame":
+            self.cookgame_key(ev)
+        elif st == "journal":
+            if k in (pygame.K_j, pygame.K_ESCAPE, pygame.K_RETURN, pygame.K_SPACE, pygame.K_e):
+                self.state = "play"
+        elif st == "wish":
+            self.wish_key(ev)
+        elif st == "mini_over":
+            if k in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_ESCAPE, pygame.K_KP_ENTER):
+                self.menu = dict(type="arcade", idx=0, scroll=0)
+                self.state = "menu"
         elif st == "play":
             if k == pygame.K_ESCAPE:
                 self.menu = dict(type="pause", idx=0)
@@ -2275,6 +6313,8 @@ class Game:
             elif k in (pygame.K_i, pygame.K_TAB):
                 self.menu = dict(type="inv", idx=0, scroll=0)
                 self.state = "menu"
+            elif k == pygame.K_j:
+                self.state = "journal"
             elif k == pygame.K_F1:
                 self.state = "help"
             elif k == pygame.K_e:
@@ -2300,51 +6340,227 @@ class Game:
             self.sel = (self.sel + d) % n
             self.sel_timer = 2.0
 
+    def send_key(self, key, mod=0):
+        self.key_down(_Key(key, mod))
+
+    def layout_display(self):
+        disp = pygame.display.get_surface()
+        dw, dh = disp.get_size()
+        self.disp_size = (dw, dh)
+        sc = min(dw / WIN_W, dh / WIN_H)
+        w, h = max(1, int(WIN_W * sc)), max(1, int(WIN_H * sc))
+        self.dst = pygame.Rect((dw - w) // 2, (dh - h) // 2, w, h)
+        self.dscale = sc
+
+    def present(self):
+        disp = pygame.display.get_surface()
+        if disp.get_size() != self.disp_size:
+            self.layout_display()
+        disp.fill((0, 0, 0))
+        pygame.transform.scale(self.screen, self.dst.size, disp.subsurface(self.dst))
+
+    def autosave(self):
+        if self.state in ("play", "menu", "dialog", "help"):
+            self.save_game()
+
     def run(self):
+        bg_events = tuple(getattr(pygame, n) for n in ("APP_WILLENTERBACKGROUND", "APP_TERMINATING")
+                          if hasattr(pygame, n))
+        back_key = getattr(pygame, "K_AC_BACK", None)
+        finger_events = (pygame.FINGERDOWN, pygame.FINGERMOTION, pygame.FINGERUP)
         while True:
             dt = min(self.clock.tick(FPS) / 1000.0, 0.05)
             for ev in pygame.event.get():
                 if ev.type == pygame.QUIT:
                     if self.state not in ("title", "summary", "fade_out", "fade_in"):
                         self.save_game()
+                    self.net_close()
                     pygame.quit()
                     sys.exit()
                 elif ev.type == pygame.KEYDOWN:
-                    self.key_down(ev)
-                elif ev.type == pygame.FINGERDOWN:
-                    self.handle_touch_down(ev)
-                elif ev.type == pygame.FINGERMOTION:
-                    if ev.finger_id == self.joystick_finger:
-                        self.update_joystick(self.touch_position(ev))
-                elif ev.type == pygame.FINGERUP:
-                    self.last_touch_time = pygame.time.get_ticks()
-                    if ev.finger_id == self.joystick_finger:
-                        self.joystick_finger = None
-                        self.joystick_vector = (0, 0)
-                        self.touch_keys.difference_update((pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN))
-                    action = self.touch_buttons.pop(ev.finger_id, None)
-                    if action == "run": self.touch_keys.discard(pygame.K_LSHIFT)
+                    if back_key is not None and ev.key == back_key:
+                        self.send_key(pygame.K_ESCAPE)
+                    else:
+                        self.key_down(ev)
+                elif ev.type == pygame.KEYUP:
+                    self.key_up(ev)
+                elif ev.type in finger_events:
+                    self.touch.handle(ev)
+                elif ev.type in bg_events:
+                    self.autosave()
+                elif ANDROID:
+                    continue  # touch also fakes mouse events on Android; we use finger events only
                 elif ev.type == pygame.MOUSEWHEEL and self.state == "play":
                     self.cycle(-ev.y)
-                elif ev.type == pygame.MOUSEBUTTONDOWN:
-                    # SDL may emit a mouse event alongside a finger event on Android.
-                    if pygame.time.get_ticks() - self.last_touch_time < 250:
-                        continue
-                    if self.state == "play":
-                        if ev.button == 1: self.use_item()
-                        elif ev.button == 3: self.interact()
-                    elif ev.button == 1:
-                        self.handle_tap_outside_play(ev.pos)
+                elif self.state == "place" and ev.type in (pygame.MOUSEMOTION, pygame.MOUSEBUTTONDOWN):
+                    self.placing_pointer((ev.pos[0] - self.dst.x) / self.dscale,
+                                         (ev.pos[1] - self.dst.y) / self.dscale,
+                                         click=(ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1))
+                elif ev.type == pygame.MOUSEBUTTONDOWN and self.state == "mini":
+                    self.mini_tap((ev.pos[0] - self.dst.x) / self.dscale, (ev.pos[1] - self.dst.y) / self.dscale)
+                elif ev.type == pygame.MOUSEBUTTONDOWN and self.state == "play":
+                    if ev.button == 1:
+                        self.use_item()
+                    elif ev.button == 3:
+                        self.interact()
             self.update(dt)
             self.draw()
+            self.touch.draw()
+            self.present()
             pygame.display.flip()
 
+
+class _Key:
+    def __init__(self, key, mod=0):
+        self.key, self.mod, self.unicode = key, mod, ""
+
+
+class TouchControls:
+    """Floating thumb-stick on the left, buttons on the right. Fingers arrive as 0..1 screen
+    coordinates and are mapped onto the 960x640 virtual screen the game draws to."""
+    STICK_R = 70
+    REST = (140, 450)
+
+    def __init__(self, game):
+        self.g = game
+        self.vec = (0.0, 0.0)
+        self.fingers = {}
+        self.pressed = set()
+        self.center = self.REST
+        self.knob = None
+        self.cache = {}
+
+    def buttons(self):
+        g = self.g
+        st = g.state
+        K = pygame
+        if st == "play":
+            return [("use", "USE", 840, 440, 56, K.K_SPACE), ("act", "E", 730, 500, 44, K.K_e),
+                    ("prev", "<", 740, 390, 26, K.K_q), ("next", ">", 800, 350, 26, K.K_r),
+                    ("bag", "BAG", 52, 52, 32, K.K_i), ("menu", "MENU", 122, 52, 32, K.K_ESCAPE)]
+        if st in ("menu", "title"):
+            b = [("up", "UP", 880, 250, 44, K.K_UP), ("down", "DOWN", 880, 370, 44, K.K_DOWN),
+                 ("ok", "OK", 880, 490, 44, K.K_RETURN)]
+            if st == "menu":
+                b.append(("back", "BACK", 80, 490, 44, K.K_ESCAPE))
+                ty = g.menu.get("type")
+                if ty in ("shop", "bin", "pc"):
+                    b.append(("alt", "x5/ALL", 80, 370, 44, K.K_RETURN))
+                if ty == "pc":
+                    b += [("left", "<", 60, 190, 34, K.K_LEFT), ("right", ">", 60, 262, 34, K.K_RIGHT)]
+            return b
+        if st in ("dialog", "help", "summary", "mini_over"):
+            return [("ok", "OK", 880, 490, 44, K.K_RETURN)]
+        if st == "place":
+            return [("use", "BUILD", 840, 440, 56, K.K_SPACE), ("back", "BACK", 80, 490, 44, K.K_ESCAPE)]
+        if st == "fishing":
+            return [("use", "REEL", 840, 440, 56, K.K_SPACE), ("back", "BACK", 80, 490, 44, K.K_ESCAPE)]
+        if st == "mini":
+            b = [("back", "QUIT", 60, 580, 36, K.K_ESCAPE)]
+            if g.mini and g.mini["kind"] == "memory":
+                b += [("up", "UP", 850, 370, 38, K.K_UP), ("down", "DOWN", 850, 510, 38, K.K_DOWN),
+                      ("left", "LEFT", 780, 440, 38, K.K_LEFT), ("right", "RIGHT", 920, 440, 38, K.K_RIGHT)]
+            return b
+        return []
+
+    def to_virtual(self, nx, ny):
+        g = self.g
+        dw, dh = g.disp_size
+        return (nx * dw - g.dst.x) / g.dscale, (ny * dh - g.dst.y) / g.dscale
+
+    def handle(self, ev):
+        x, y = self.to_virtual(ev.x, ev.y)
+        fid = ev.finger_id
+        if ev.type == pygame.FINGERDOWN:
+            self.down(fid, x, y)
+        elif ev.type == pygame.FINGERMOTION:
+            if self.fingers.get(fid) == "stick":
+                self.drag(x, y)
+        else:
+            self.up(fid)
+
+    def down(self, fid, x, y):
+        g = self.g
+        if g.state == "title" and g.title_click(x, y):
+            return
+        if g.state == "place":
+            g.placing_pointer(x, y, click=False)
+            return
+        for name, label, bx, by, r, key in self.buttons():
+            if math.hypot(x - bx, y - by) <= r + 8:
+                self.fingers[fid] = name
+                self.pressed.add(name)
+                g.send_key(key, pygame.KMOD_SHIFT if name == "alt" else 0)
+                return
+        if g.state == "play":
+            for rr, i in g.hotbar_rects:
+                if rr.inflate(6, 6).collidepoint(x, y):
+                    g.sel = i
+                    return
+            if x < WIN_W * 0.45 and y > 130:
+                self.fingers[fid] = "stick"
+                self.center = (x, y)
+                self.drag(x, y)
+        elif g.state == "mini":
+            if g.mini["kind"] == "veggie":
+                if x < WIN_W * 0.5:
+                    self.fingers[fid] = "stick"
+                    self.center = (x, y)
+                    self.drag(x, y)
+            else:
+                g.mini_tap(x, y)
+        elif g.state in ("dialog", "help", "summary", "mini_over"):
+            g.send_key(pygame.K_RETURN)
+
+    def drag(self, x, y):
+        cx, cy = self.center
+        dx, dy = x - cx, y - cy
+        d = math.hypot(dx, dy)
+        if d > self.STICK_R:
+            dx, dy = dx / d * self.STICK_R, dy / d * self.STICK_R
+        self.knob = (cx + dx, cy + dy)
+        vx, vy = dx / self.STICK_R, dy / self.STICK_R
+        self.vec = (vx, vy) if math.hypot(vx, vy) > 0.22 else (0.0, 0.0)
+
+    def up(self, fid):
+        what = self.fingers.pop(fid, None)
+        if what == "stick":
+            self.vec, self.knob, self.center = (0.0, 0.0), None, self.REST
+        elif what:
+            self.pressed.discard(what)
+            if what == "use" and self.g.state == "fishing":
+                self.g.fishing_up()
+
+    def circle(self, r, alpha):
+        s = self.cache.get((r, alpha))
+        if s is None:
+            s = pygame.Surface((r * 2 + 4, r * 2 + 4), pygame.SRCALPHA)
+            pygame.draw.circle(s, (255, 244, 220, alpha), (r + 2, r + 2), r)
+            pygame.draw.circle(s, (52, 36, 28, 190), (r + 2, r + 2), r, 3)
+            self.cache[(r, alpha)] = s
+        return s
+
+    def draw(self):
+        g = self.g
+        if g.state in ("fade_out", "fade_in"):
+            return
+        if g.state == "play" or (g.state == "mini" and g.mini and g.mini["kind"] == "veggie"):
+            c = self.center
+            g.screen.blit(self.circle(self.STICK_R, 50), (c[0] - self.STICK_R - 2, c[1] - self.STICK_R - 2))
+            k = self.knob or c
+            g.screen.blit(self.circle(30, 130 if self.knob else 70), (k[0] - 32, k[1] - 32))
+        for name, label, bx, by, r, key in self.buttons():
+            g.screen.blit(self.circle(r, 150 if name in self.pressed else 80), (bx - r - 2, by - r - 2))
+            g.text(label, (bx, by - 8), g.f_s, (52, 36, 28), center=True)
 
 ICONS_TOOLS = set(TOOLS)
 
 
 def main():
     pygame.init()
+    loaded = load_mods()
+    if loaded:
+        print("Loaded mods:", ", ".join(loaded))
     Game().run()
 
 
