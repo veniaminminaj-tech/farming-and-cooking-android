@@ -22,7 +22,7 @@ HOW TO PLAY
   4. Put goods in the Shipping Bin (the wooden box). You get paid overnight.
   5. Open your CAFE (big building east of the farm): cook what guests order and
      serve them at their tables. Order seeds, recipes and upgrades on the PC by
-     the house, fish at the pond, and play mini-games at the village arcade.
+     the house, fish in the river or the sea, and play mini-games at the village arcade.
   6. Chop trees (axe) and mine rocks (pickaxe) to clear land.
   7. Sleep in your house before 2am or you will pass out!
 """
@@ -51,7 +51,9 @@ NET_PORT = 7788
 GAME_BUILD_DEFAULT = "host"   # build_exes.py flips this to "player" for the join-only build
 GAME_BUILD = "player" if "--player" in sys.argv else GAME_BUILD_DEFAULT
 CAN_HOST = GAME_BUILD == "host"
-MAP_W, MAP_H = 128, 96
+MAP_W, MAP_H = 160, 96
+FARM_W = 128             # width of the land; the sea fills the columns east of the beach
+SEA_SHORE = 126          # the beach starts here; the shoreline wobbles a little from row to row
 FPS = 60
 ANDROID = "ANDROID_ARGUMENT" in os.environ or "ANDROID_PRIVATE" in os.environ
 _SAVE_DIR = os.environ.get("ANDROID_PRIVATE") if ANDROID else os.path.dirname(os.path.abspath(__file__))
@@ -68,9 +70,9 @@ RX0, RY0, RX1, RY1 = 20, 14, 43, 29          # cafe room, inclusive tile bounds
 CAFE_DOOR_IN = (32 * TILE + 8, 28 * TILE + 8)  # inside, next to the exit door
 CAFE_EXIT_OUT = (42 * TILE + 8, 19 * TILE + 10)  # outside, facing the cafe front
 HOUSE_EXIT_OUT = (29 * TILE + 8, 10 * TILE + 10)  # outside, facing the front door of the house
-FARM_DOCK_OUT = (10 * TILE + 8, 36 * TILE + 8)     # back on the farm, facing the dock
 VILLAGE_PORT_TX, VILLAGE_PORT_TY = 121, 43        # the ferry port at the far east end, past the secondary village
 VILLAGE_PORT_OUT = ((VILLAGE_PORT_TX + 2) * TILE + 8, VILLAGE_PORT_TY * TILE + 8)
+FARM_DOCK_OUT = VILLAGE_PORT_OUT                   # the ferry port is the only way to sail now
 PORT_HOUSE_TX, PORT_HOUSE_TY = 120, 48             # the port house on the harbour's south shore
 PORT_HOUSE_OUT = ((PORT_HOUSE_TX + 2) * TILE + 8, (PORT_HOUSE_TY + 5) * TILE + 10)   # outside, facing its door
 STATION_SPAWN = (25 * TILE + 8, 37 * TILE + 8)     # at the Ruined Station dock, facing the boat
@@ -683,6 +685,11 @@ FERN_LINES = [
 
 
 # ============================================================ helpers
+def sea_beach_x(y):
+    """First beach column on row y. The shoreline wobbles gently so it looks like a real coast."""
+    return SEA_SHORE + int(round(1 + 0.6 * math.sin(y / 5.5) + 0.4 * math.sin(y / 2.3)))
+
+
 def river_center(y):
     """Column of the middle of the river on row y (the river winds left and right)."""
     return 89 + int(round(3 * math.sin(y / 8.5) + 1.5 * math.sin(y / 3.7)))
@@ -997,7 +1004,8 @@ def make_icon(key):
                 C((248, 190, 40), 8, 9, 2)
             elif key == "bread":
                 E((206, 146, 76), 3, 3, 10, 9)
-                E((232, 178, 100), 3, 3, 10, 5)                for x in (5, 8, 11):
+                E((232, 178, 100), 3, 3, 10, 5)
+                for x in (5, 8, 11):
                     L((170, 112, 56), (x, 4), (x + 1, 7))
             elif key == "pie":
                 E((214, 160, 90), 2, 5, 12, 9)
@@ -1535,6 +1543,18 @@ def build_season_sprites(season):
             t.fill((96, 168, 220), (x0, y, 5, 1))
             t.fill((78, 150, 204), ((x0 + 6) % 11, (y + 1) % 16, 2, 1))
         SPR["water"].append(t)
+    # Open sea: deeper blue with white-capped waves
+    SPR["sea"] = []
+    for f in range(4):
+        t = pygame.Surface((16, 16))
+        t.fill((36, 98, 160))
+        for band in range(3):
+            y = (band * 5 + f * 3) % 16
+            x0 = (band * 7 + f * 2) % 12
+            t.fill((20, 74, 130), (x0, (y + 2) % 16, 6, 1))
+            t.fill((84, 150, 206), (x0, y, 4, 1))
+            t.fill((196, 226, 244), ((x0 + 1) % 14, y, 2, 1))
+        SPR["sea"].append(t)
     # Bridge deck: planks with railings on the top and bottom rows
     SPR["bridge"] = []
     for row in ("top", "mid", "bottom"):
@@ -1996,7 +2016,8 @@ class NetServer:
                 break
             buf += data
             while b"\n" in buf:
-                line, buf = buf.split(b"\n", 1)                try:
+                line, buf = buf.split(b"\n", 1)
+                try:
                     msg = json.loads(line.decode())
                 except ValueError:
                     continue
@@ -2158,6 +2179,15 @@ class Extras:
         self.last_port, self.cg = "farm", None
         self.after_dialog, self.wish_idx, self.wishes_done, self.wish_opts = None, 0, set(), []
         self.warp = None
+        self.island_world = None
+        self.dungeon_enemies = []
+        self.dungeon_wave = 0
+        self.dungeon_floor = 1
+        self.dungeon_best_floor = 1
+        self.dungeon_kills = 0
+        self.dungeon_attack_cd = 0.0
+        self.dungeon_hit_flash = 0.0
+        self.dungeon_boss_done = False
         if not hasattr(self, "net_server"):  # set once; new_game() must not drop a live connection
             self.net_server = None
             self.net_client = None
@@ -2995,7 +3025,8 @@ class Extras:
     def draw_pc(self):
         m = self.menu
         tab = m["tab"]
-        scr = self.screen        r = pygame.Rect(WIN_W // 2 - 340, WIN_H // 2 - 270, 680, 540)
+        scr = self.screen
+        r = pygame.Rect(WIN_W // 2 - 340, WIN_H // 2 - 270, 680, 540)
         pygame.draw.rect(scr, (30, 34, 44), r.inflate(28, 28), border_radius=16)
         pygame.draw.rect(scr, (222, 236, 248), r, border_radius=8)
         pygame.draw.rect(scr, (40, 90, 170), (r.x, r.y, r.w, 44), border_radius=8)
@@ -3994,7 +4025,8 @@ class Game(Extras):
         scr = self.screen
         ov = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
         ov.fill((24, 14, 10, 175))
-        scr.blit(ov, (0, 0))        rec = RECIPES[cg["key"]]
+        scr.blit(ov, (0, 0))
+        rec = RECIPES[cg["key"]]
         r = pygame.Rect(WIN_W // 2 - 300, 40, 600, 560)
         self.panel(r)
         self.text(rec["name"], (r.x + 24, r.y + 14), self.f_l, TEXT)
@@ -4119,22 +4151,6 @@ class Game(Extras):
         prect(90, 44, 124, 45)
         for hx in (98, 106, 114):                 # a short lane to each village front door
             prect(hx + 2, 42, hx + 2, 43)
-        cx, cy, rx, ry = 11, 30, 6, 4
-        for y in range(MAP_H):
-            for x in range(MAP_W):
-                d = ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2
-                if d <= 1.0:
-                    T[y][x] = WATER
-                elif d <= 1.7 and T[y][x] == GRASS:
-                    T[y][x] = SAND
-        cx2, cy2, rx2, ry2 = 84, 58, 8, 5
-        for y in range(MAP_H):
-            for x in range(MAP_W):
-                d = ((x - cx2) / rx2) ** 2 + ((y - cy2) / ry2) ** 2
-                if d <= 1.0:
-                    T[y][x] = WATER
-                elif d <= 1.7 and T[y][x] == GRASS:
-                    T[y][x] = SAND
         # A winding river runs down the eastern side of the farm/village.
         # Keep just one broad wooden crossing, aligned with the Fish Master route.
         for y in range(MAP_H):
@@ -4153,9 +4169,18 @@ class Game(Extras):
                 if 0 <= xx < MAP_W:
                     T[yy][xx] = BRIDGE
 
-        # A harbour basin at the far east end of the map, past the secondary village. The ferry port sits on its north shore.
+        # The open sea runs the full height of the map along the east edge. A sandy beach with a
+        # gently wavy shoreline separates it from the land.
+        for y in range(MAP_H):
+            beach = sea_beach_x(y)
+            for x in range(beach, MAP_W):
+                if x >= beach + 3:
+                    T[y][x] = WATER
+                elif T[y][x] == GRASS:
+                    T[y][x] = SAND
+        # The harbour is an inlet of the sea, past the secondary village. The ferry port sits on its north shore.
         for yy in range(44, 47):
-            for xx in range(120, 127):
+            for xx in range(120, MAP_W):
                 T[yy][xx] = WATER
 
         self.buildings = [
@@ -4169,7 +4194,6 @@ class Game(Extras):
             dict(kind="coop", tx=45, ty=26, w=3, h=2),
             dict(kind="cafe", tx=38, ty=15, w=8, h=4),
             dict(kind="bench", tx=35, ty=6, w=2, h=1),
-            dict(kind="dock", tx=10, ty=35, w=2, h=1),
             dict(kind="village_port", tx=VILLAGE_PORT_TX, ty=VILLAGE_PORT_TY, w=2, h=1),
             dict(kind="port_house", tx=PORT_HOUSE_TX, ty=PORT_HOUSE_TY, w=6, h=5),
             dict(kind="arcade", tx=57, ty=17, w=2, h=1),
@@ -4222,7 +4246,7 @@ class Game(Extras):
             placed = tries = 0
             while placed < n and tries < n * 40:
                 tries += 1
-                x, y = rnd.randrange(5, MAP_W - 5), rnd.randrange(4, MAP_H - 4)
+                x, y = rnd.randrange(5, FARM_W - 5), rnd.randrange(4, MAP_H - 4)
                 if (x, y) in res or (x, y) in self.objs:
                     continue
                 put(x, y, t, v=rnd.randrange(3 if t != "tree" else 2), **kw)
@@ -4341,6 +4365,32 @@ class Game(Extras):
         self.update_effects(dt)
 
     def switch_location(self, target):
+        # The dungeon is a sub-area of the fisherman's island. Preserve the island
+        # world in memory so leaving the dungeon returns to the same island.
+        if target == "dungeon" and self.location == "island":
+            self.island_world = {k: getattr(self, k) for k in self.WORLD_KEYS}
+            # Like Stardew Valley's mine elevator, every fifth cleared floor
+            # becomes a checkpoint when the player leaves and returns.
+            self.dungeon_floor = max(1, (self.dungeon_best_floor // 5) * 5)
+            self.build_dungeon(self.dungeon_floor)
+            self.location = "dungeon"
+            self.player.x, self.player.y = (40 * TILE + 8, 70 * TILE + 8)
+            self.player.dir = "down"
+            self.toast("Fisherman's Catacombs — clear the rooms and find the exit!")
+            self.focus = None
+            self.rebuild_solid()
+            return
+        if target == "island" and self.location == "dungeon":
+            if self.island_world:
+                for k, v in self.island_world.items():
+                    setattr(self, k, v)
+            self.island_world = None
+            self.location = "island"
+            self.player.x, self.player.y = (58 * TILE + 8, 38 * TILE + 8)
+            self.player.dir = "down"
+            self.focus = None
+            self.rebuild_solid()
+            return
         if target != "farm" and self.location not in ("farm", target):
             self.switch_location("farm")          # sail back to the farm, then on to the new place
         if target != "farm" and self.location == "farm":
@@ -4400,7 +4450,8 @@ class Game(Extras):
                     T[y][x] = WATER
         self.tiles = T
         self.buildings = [dict(kind="dock_back", tx=34, ty=46, w=2, h=1),
-                          dict(kind="port", tx=84, ty=44, w=2, h=1)]
+                          dict(kind="port", tx=84, ty=44, w=2, h=1),
+                          dict(kind="dungeon", tx=58, ty=34, w=2, h=2)]
         self.bld_at = {}
         for b in self.buildings:
             for yy in range(b["ty"], b["ty"] + b["h"]):
@@ -4410,7 +4461,7 @@ class Game(Extras):
         self.objs = {}
         for y in range(MAP_H):
             for x in range(MAP_W):
-                if T[y][x] != GRASS or abs(x - 34) < 3 and abs(y - 46) < 3 or abs(x - 84.5) < 2.5 and abs(y - 44) < 3:
+                if T[y][x] != GRASS or abs(x - 34) < 3 and abs(y - 46) < 3 or abs(x - 84.5) < 2.5 and abs(y - 44) < 3 or (56 <= x <= 61 and 32 <= y <= 37):
                     continue
                 r = rnd.random()
                 if r < 0.05:
@@ -4428,6 +4479,154 @@ class Game(Extras):
                           wander=(42, 42, 50, 50))]
         self.customers = []
         self.rebuild_solid()
+
+    def build_dungeon(self, floor=None):
+        """Generate a Stardew-like mine with themed floors, ore rocks and deeper challenges."""
+        if floor is not None:
+            self.dungeon_floor = max(1, min(40, int(floor)))
+        floor = self.dungeon_floor
+        rnd = random.Random(814 + floor * 97)
+        T = [[WALL for _ in range(MAP_W)] for _ in range(MAP_H)]
+        # A branching chain of chambers; each floor gets a slightly different layout.
+        rooms = [(34, 65, 15, 12), (49, 64, 17, 13), (66, 64, 15, 13),
+                 (49, 49, 18, 14), (34, 35, 16, 14), (51, 34, 17, 14), (68, 39, 13, 12)]
+        for i, (x0, y0, w, h) in enumerate(rooms):
+            # Small floor-to-floor variations without breaking the connecting paths.
+            ox = rnd.randrange(-1, 2) if i in (1, 3, 5) else 0
+            oy = rnd.randrange(-1, 2) if i in (2, 4, 6) else 0
+            for y in range(y0+oy, y0+h+oy):
+                for x in range(x0+ox, x0+w+ox):
+                    if 1 <= x < MAP_W-1 and 1 <= y < MAP_H-1:
+                        T[y][x] = WOOD_FLOOR
+        # Corridors keep every chamber reachable.
+        for y in range(64, 68):
+            for x in range(47, 52): T[y][x] = WOOD_FLOOR
+        for y in range(59, 66):
+            for x in range(63, 68): T[y][x] = WOOD_FLOOR
+        for y in range(48, 66):
+            for x in range(56, 60): T[y][x] = WOOD_FLOOR
+        for y in range(45, 51):
+            for x in range(47, 54): T[y][x] = WOOD_FLOOR
+        for y in range(39, 50):
+            for x in range(43, 47): T[y][x] = WOOD_FLOOR
+        for y in range(39, 44):
+            for x in range(50, 54): T[y][x] = WOOD_FLOOR
+        for y in range(43, 47):
+            for x in range(66, 70): T[y][x] = WOOD_FLOOR
+        # Entry chamber and return door.
+        for y in range(69, 73):
+            for x in range(38, 43): T[y][x] = WOOD_FLOOR
+        self.tiles = T
+        self.buildings = [dict(kind="exitdoor", tx=39, ty=71, w=2, h=1),
+                          dict(kind="mine_down", tx=73, ty=67, w=1, h=1)]
+        self.bld_at = {}
+        for b in self.buildings:
+            for yy in range(b["ty"], b["ty"] + b["h"]):
+                for xx in range(b["tx"], b["tx"] + b["w"]):
+                    self.bld_at[(xx, yy)] = b
+        self.objs = {}
+        self.tables, self.lamps, self.fences, self.reserved = [], [], set(), set()
+        self.soil, self.chickens, self.eggs, self.npcs, self.customers = {}, [], [], [], []
+        # Mineable rocks double as ore nodes; deeper floors have more valuable drops.
+        for x0, y0, w, h in rooms:
+            for _ in range(7 + min(8, floor // 3)):
+                x, y = rnd.randrange(x0+1, x0+w-1), rnd.randrange(y0+1, y0+h-1)
+                if T[y][x] == WOOD_FLOOR and (x, y) not in self.bld_at:
+                    ore = "copper" if floor < 6 else "iron" if floor < 16 else "gold" if floor < 26 else "iridium"
+                    self.objs[(x,y)] = dict(t="rock", hp=2 + floor//12, v=rnd.randrange(3), ore=ore)
+        self.dungeon_wave = floor
+        self.dungeon_kills = 0
+        self.dungeon_boss_done = False
+        self.dungeon_attack_cd = 0.0
+        self.dungeon_hit_flash = 0.0
+        self.dungeon_enemies = []
+        # More enemies every few floors; every fifth floor ends with a tougher guardian.
+        enemy_count = min(3 + floor // 2, 12)
+        kinds = ["crawler", "crawler", "hound"]
+        if floor >= 4: kinds += ["hound", "brute"]
+        for i in range(enemy_count):
+            room = rooms[1 + (i % (len(rooms)-1))]
+            x = rnd.randrange(room[0]+2, room[0]+room[2]-2)
+            y = rnd.randrange(room[1]+2, room[1]+room[3]-2)
+            kind = "brute" if floor % 5 == 0 and i == enemy_count-1 else rnd.choice(kinds)
+            hp = (3 if kind == "crawler" else 4 if kind == "hound" else 8) + floor//4
+            self.dungeon_enemies.append(dict(x=x*TILE+8,y=y*TILE+8,hp=hp,maxhp=hp,kind=kind,
+                                             speed=(24 if kind == "crawler" else 19 if kind == "hound" else 13) + min(8, floor//6),
+                                             attack=0.0,flash=0.0,alive=True))
+        self.rebuild_solid()
+
+    def descend_mine(self):
+        if any(e["alive"] for e in self.dungeon_enemies):
+            self.toast("Defeat every monster to unlock the ladder!")
+            return
+        if self.dungeon_floor >= 40:
+            self.toast("You reached the deepest mine floor! The treasure is yours.")
+            self.add_item("old_coin", 20, quiet=True)
+            return
+        self.dungeon_floor += 1
+        self.dungeon_best_floor = max(self.dungeon_best_floor, self.dungeon_floor)
+        self.build_dungeon(self.dungeon_floor)
+        self.player.x, self.player.y = 40*TILE+8, 70*TILE+8
+        self.player.dir = "up"
+        self.focus = None
+        self.toast("Mine floor %d — deeper, darker and tougher!" % self.dungeon_floor)
+
+    def dungeon_attack(self):
+        if self.dungeon_attack_cd > 0:
+            return
+        self.dungeon_attack_cd = 0.38
+        p = self.player
+        dx, dy = DIRS[p.dir]
+        p.act = p.act_dur = 0.22
+        p.act_tool = None
+        hit = False
+        for e in self.dungeon_enemies:
+            if not e["alive"]: continue
+            vx, vy = e["x"]-p.x, e["y"]-p.y
+            along = vx*dx + vy*dy
+            side = abs(vx*dy - vy*dx)
+            if 0 < along < 31 and side < 19:
+                e["hp"] -= 2
+                e["flash"] = 0.16
+                hit = True
+                if e["hp"] <= 0:
+                    e["alive"] = False
+                    self.dungeon_kills += 1
+                    self.add_item("old_coin", 1, quiet=True)
+                    if random.random() < 0.55: self.add_item("scrap", 1, quiet=True)
+                    self.sparkle(e["x"], e["y"], 5)
+        if hit:
+            self.toast("Hit! + dungeon loot")
+        else:
+            self.toast("Slash!")
+
+    def update_dungeon(self, dt):
+        self.dungeon_attack_cd = max(0.0, self.dungeon_attack_cd-dt)
+        self.dungeon_hit_flash = max(0.0, self.dungeon_hit_flash-dt)
+        p = self.player
+        for e in self.dungeon_enemies:
+            if not e["alive"]: continue
+            e["flash"] = max(0.0, e["flash"]-dt)
+            dx, dy = p.x-e["x"], p.y-e["y"]
+            dist = max(0.001, math.hypot(dx,dy))
+            if dist < 155:
+                step = min(e["speed"]*dt, max(0,dist-13))
+                nx, ny = e["x"]+dx/dist*step, e["y"]+dy/dist*step
+                if not self.box_blocked(nx,ny,5,4): e["x"],e["y"] = nx,ny
+            e["attack"] = max(0.0,e["attack"]-dt)
+            if dist < 17 and e["attack"] <= 0:
+                e["attack"] = 1.15
+                self.energy = max(0,self.energy-5)
+                self.dungeon_hit_flash = 0.22
+                self.toast("A monster hit you! -5 energy")
+        if not any(e["alive"] for e in self.dungeon_enemies) and not self.dungeon_boss_done:
+            self.dungeon_boss_done = True
+            self.add_item("old_coin", 3 + self.dungeon_floor, quiet=True)
+            if self.dungeon_floor % 5 == 0:
+                self.add_item("rare_fish", 1, quiet=True)
+                self.toast("Guardian defeated! Elevator checkpoint unlocked.")
+            else:
+                self.toast("Floor %d cleared! The ladder is unlocked." % self.dungeon_floor)
 
     def build_station(self):
         """The Ruined Station: an old sea port on a rocky shore. Searching the ruins finds scrap."""
@@ -4620,7 +4819,24 @@ class Game(Extras):
         self.player.x, self.player.y = d["px"], d["py"]
         self.ensure_season()
         self.rebuild_solid()
+        self.unstick_player()
         return True
+
+    def unstick_player(self):
+        """Moves the player to the nearest free tile if they were saved on a tile that is now blocked."""
+        p = self.player
+        if not self.box_blocked(p.x, p.y):
+            return
+        tx, ty = int(p.x // TILE), int(p.y // TILE)
+        for r in range(1, 40):
+            for dy in range(-r, r + 1):
+                for dx in range(-r, r + 1):
+                    if max(abs(dx), abs(dy)) != r:
+                        continue
+                    x, y = (tx + dx) * TILE + 8, (ty + dy) * TILE + 8
+                    if 0 < tx + dx < MAP_W and 0 < ty + dy < MAP_H and not self.box_blocked(x, y):
+                        p.x, p.y = x, y
+                        return
 
     # ------------------------------------------------------- inventory helpers
     def hotbar(self):
@@ -4760,7 +4976,7 @@ class Game(Extras):
         self.swing(key)
         if key == "rod":
             if tt != WATER:
-                self.toast("Cast your rod at the pond.")
+                self.toast("Cast your rod at the river or the sea.")
             elif self.energy < cost:
                 self.toast("You're too tired! Eat something or go to sleep.")
             else:
@@ -4785,7 +5001,7 @@ class Game(Extras):
         if not possible:
             return
         if key == "can" and self.water <= 0:
-            self.toast("The can is empty. Refill it at the pond!")
+            self.toast("The can is empty. Refill it at the river or the sea!")
             return
         if self.energy < cost:
             self.toast("You're too tired! Eat something or go to sleep.")
@@ -4820,6 +5036,10 @@ class Game(Extras):
                 if o["hp"] <= 0:
                     del self.objs[(tx, ty)]
                     self.add_item("stone", 2)
+                    if self.location == "dungeon" and o.get("ore"):
+                        self.add_item("scrap", 1 + (self.dungeon_floor // 10), quiet=True)
+                        if random.random() < 0.35:
+                            self.add_item("old_coin", 1, quiet=True)
                     self.rebuild_solid()
                     self.sparkle(cx, cy)
             else:
@@ -4885,6 +5105,7 @@ class Game(Extras):
         return {"dock": "E  Sail to the island", "dock_back": "E  Sail home",
                 "village_port": "E  Board the ferry to the island", "port_house": "E  Enter the port house",
                 "port": "E  Sail to the Ruined Station", "ruin": "E  Search the ruins",
+                "dungeon": "E  Enter the mines", "mine_down": "E  Descend to the next floor",
                 "house": "E  Enter house", "bed": "E  Sleep", "computer": "E  Use computer",
                 "bench": "E  Workbench", "kitchen": "E  Cook", "bin": "E  Ship goods",
                 "stall": "E  Shop", "coop": "E  Look", "cafe": "E  Enter cafe", "register": "E  Register", "stove": "E  Cook", "exitdoor": "E  Leave",
@@ -4940,6 +5161,11 @@ class Game(Extras):
                 self.start_warp("portHouse")
             elif k == "ruin":
                 self.search_ruin(data)
+            elif k == "dungeon":
+                self.dungeon_floor = 1
+                self.start_warp("dungeon")
+            elif k == "mine_down":
+                self.descend_mine()
             elif k == "kitchen":
                 self.menu = dict(type="cook", idx=0, scroll=0)
                 self.state = "menu"
@@ -4960,7 +5186,7 @@ class Game(Extras):
                 self.menu = dict(type="cook", idx=0, scroll=0)
                 self.state = "menu"
             elif k == "exitdoor":
-                self.start_warp("farm")
+                self.start_warp("island" if self.location == "dungeon" else "farm")
             elif k == "pc":
                 self.menu = dict(type="pc", tab=0, idx=0, scroll=0)
                 self.state = "menu"
@@ -4993,7 +5219,8 @@ class Game(Extras):
         for s in self.soil.values():
             if s["crop"] and s["wet"] and s["age"] < CROPS[s["crop"]]["days"]:
                 s["age"] += 1
-            s["wet"] = False        deliveries = list(self.pending.items())
+            s["wet"] = False
+        deliveries = list(self.pending.items())
         for k, n in deliveries:
             self.inv[k] = self.inv.get(k, 0) + n
         self.pending = {}
@@ -5019,7 +5246,7 @@ class Game(Extras):
         tries = 0
         while flowers < 200 and tries < 40:
             tries += 1
-            x, y = random.randrange(5, MAP_W - 5), random.randrange(4, MAP_H - 4)
+            x, y = random.randrange(5, FARM_W - 5), random.randrange(4, MAP_H - 4)
             if (x, y) in self.reserved or (x, y) in self.objs or (x, y) in self.soil:
                 continue
             self.objs[(x, y)] = dict(t="flower", v=random.randrange(3))
@@ -5073,6 +5300,8 @@ class Game(Extras):
             touch_used = True
             analog = min(1.0, math.hypot(mx, my))
         p.moving = False
+        if self.location == "dungeon":
+            self.update_dungeon(dt)
         if p.act > 0:
             p.act -= dt
         elif mx or my:
@@ -5215,7 +5444,8 @@ class Game(Extras):
                 dx, dy = tx * TILE - cx, ty * TILE - cy
                 h = (tx * 73856093 ^ ty * 19349663)
                 if tt == WATER:
-                    surf_.blit(SPR["water"][int(t * 2.2 + tx * 0.35 + ty * 0.2) % 4], (dx, dy))
+                    deep = self.location == "farm" and tx >= SEA_SHORE + 6
+                    surf_.blit(SPR["sea" if deep else "water"][int(t * 2.2 + tx * 0.35 + ty * 0.2) % 4], (dx, dy))
                     for nx, ny, r in ((0, -1, (0, 0, 16, 2)), (0, 1, (0, 14, 16, 2)),
                                       (-1, 0, (0, 0, 2, 16)), (1, 0, (14, 0, 2, 16))):
                         xx, yy = tx + nx, ty + ny
@@ -5330,6 +5560,22 @@ class Game(Extras):
                 bx, by = b["tx"] * TILE - cx, b["ty"] * TILE - cy
                 surf_.blit(SPR["cafe"], (bx, by))
                 self.window_glow(surf_, bx, by, [(12, 36, 24, 18), (92, 36, 24, 18)])
+            elif b["kind"] == "dungeon":
+                bx, by = b["tx"] * TILE - cx, b["ty"] * TILE - cy - 5
+                pygame.draw.rect(surf_, (58, 48, 45), (bx-2, by+3, 36, 34))
+                pygame.draw.rect(surf_, (110, 91, 77), (bx+2, by+7, 28, 27))
+                pygame.draw.rect(surf_, (24, 22, 29), (bx+7, by+12, 18, 22))
+                pygame.draw.arc(surf_, (180, 148, 105), (bx+7, by+7, 18, 17), 0, math.pi, 3)
+                pygame.draw.rect(surf_, (190, 145, 78), (bx+2, by+30, 28, 3))
+                self.text("DUNGEON", (bx+16, by-5), self.f_s, (245,220,170), center=True, shadow=(20,15,12))
+            elif b["kind"] == "mine_down":
+                bx, by = b["tx"] * TILE - cx, b["ty"] * TILE - cy
+                unlocked = not any(e["alive"] for e in self.dungeon_enemies)
+                pygame.draw.rect(surf_, (38, 30, 29), (bx-2, by-2, 22, 22))
+                pygame.draw.rect(surf_, (150, 117, 78) if unlocked else (83, 75, 69), (bx+1, by+1, 16, 16), 2)
+                pygame.draw.line(surf_, (185, 150, 100) if unlocked else (100, 95, 90), (bx+4,by+4), (bx+4,by+15), 2)
+                pygame.draw.line(surf_, (185, 150, 100) if unlocked else (100, 95, 90), (bx+14,by+4), (bx+14,by+15), 2)
+                for yy in (by+7, by+11): pygame.draw.line(surf_, (185,150,100), (bx+4,yy), (bx+14,yy), 2)
             elif b["kind"] in ("stove", "register", "exitdoor", "bed", "computer", "bench", "dock", "dock_back", "port", "ruin", "village_port"):
                 surf_.blit(SPR["fur_" + b["kind"]], (b["tx"] * TILE - cx, b["ty"] * TILE - cy - 4))
             elif b["kind"] == "pc":
@@ -5992,7 +6238,8 @@ class Game(Extras):
     def draw_title(self):
         self.t += 0
         px = 27 * TILE + 48
-        cam = (clamp(int(px - VIEW_W / 2 + math.sin(self.t * 0.15) * 70), 0, MAP_W * TILE - VIEW_W),               clamp(int(5 * TILE - 40 + math.sin(self.t * 0.1) * 20), 0, MAP_H * TILE - VIEW_H))
+        cam = (clamp(int(px - VIEW_W / 2 + math.sin(self.t * 0.15) * 70), 0, MAP_W * TILE - VIEW_W),
+               clamp(int(5 * TILE - 40 + math.sin(self.t * 0.1) * 20), 0, MAP_H * TILE - VIEW_H))
         self.render_scene(cam, hud=False)
         shade = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
         shade.fill((30, 18, 10, 90))
@@ -6186,6 +6433,34 @@ class Game(Extras):
         if hud:
             self.draw_hud(cam)
 
+    def draw_dungeon_overlay(self, cam):
+        cx, cy = cam
+        # Pixel-art monsters with chunky outlines and simple hit flashes.
+        for e in self.dungeon_enemies:
+            if not e["alive"]: continue
+            x, y = int((e["x"]-cx)*SCALE), int((e["y"]-cy)*SCALE)
+            col = (255,225,170) if e["flash"] > 0 else ((170,65,82) if e["kind"] != "brute" else (125,70,150))
+            pygame.draw.ellipse(self.screen, (18,15,22), (x-15,y+9,30,9))
+            pygame.draw.rect(self.screen, (30,22,30), (x-12,y-13,24,25))
+            pygame.draw.rect(self.screen, col, (x-10,y-15,20,22))
+            pygame.draw.rect(self.screen, (235,75,70), (x-7,y-8,4,4))
+            pygame.draw.rect(self.screen, (235,75,70), (x+3,y-8,4,4))
+            pygame.draw.rect(self.screen, (25,20,26), (x-13,y-23,26,4))
+            pygame.draw.rect(self.screen, (220,65,75), (x-12,y-22,int(24*max(0,e["hp"])/e["maxhp"]),2))
+        # Souls-like compact combat status and a deliberately retro pixel HUD.
+        panel = pygame.Rect(14, 12, 250, 43)
+        pygame.draw.rect(self.screen, (18,15,24), panel, border_radius=5)
+        pygame.draw.rect(self.screen, (135,105,84), panel, 2, border_radius=5)
+        self.text("MINES  |  FLOOR %02d  |  FOES %d" % (self.dungeon_floor, sum(1 for e in self.dungeon_enemies if e["alive"])),
+                  (24,19), self.f_s, (245,220,180))
+        pygame.draw.rect(self.screen, (55,35,42), (24,37,210,8))
+        pygame.draw.rect(self.screen, (180,55,65), (24,37,int(210*clamp(self.energy/max(1,self.max_energy),0,1)),8))
+        self.text("SPACE: ATTACK   CLEAR FLOOR: DESCEND   E: EXIT", (WIN_W-16, 18), self.f_s, (255,235,195), right=True, shadow=(20,15,20))
+        if self.dungeon_hit_flash > 0:
+            veil = pygame.Surface((WIN_W,WIN_H),pygame.SRCALPHA)
+            veil.fill((180,25,35,int(55*self.dungeon_hit_flash/0.22)))
+            self.screen.blit(veil,(0,0))
+
     def draw(self):
         st = self.state
         if st == "title":
@@ -6199,6 +6474,8 @@ class Game(Extras):
         else:
             cam = self.camera()
             self.render_scene(cam)
+            if self.location == "dungeon":
+                self.draw_dungeon_overlay(cam)
             if st == "menu":
                 self.draw_menu()
             elif st == "dialog":
@@ -6320,7 +6597,10 @@ class Game(Extras):
             elif k == pygame.K_e:
                 self.interact()
             elif k in (pygame.K_SPACE, pygame.K_RETURN):
-                self.use_item()
+                if self.location == "dungeon":
+                    self.dungeon_attack()
+                else:
+                    self.use_item()
             elif k == pygame.K_q:
                 self.cycle(-1)
             elif k == pygame.K_r:
